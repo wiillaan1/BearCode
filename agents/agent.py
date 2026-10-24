@@ -27,11 +27,13 @@ from agents.session_memory import (
     FOLD_COMPONENT_SYSTEMS,
     FOLD_SESSION_MEMORY_SYSTEM,
     build_anthropic_transcript,
+    build_component_user_prompt,
     build_folding_user_prompt,
     build_openai_transcript,
     format_folded_memory,
     parse_folded_memory,
     parse_fold_component,
+    split_previous_memory,
 )
 from agents.session import save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
@@ -1082,10 +1084,11 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         if len (self._anthropic_messages)<4:
             return False
 
-        transcript = build_anthropic_transcript(_sanitize_for_utf8(self._anthropic_messages))
+        previous_memory, messages = split_previous_memory(_sanitize_for_utf8(self._anthropic_messages))
+        transcript = build_anthropic_transcript(messages)
         if not transcript.strip():
             return False
-        memory = await self._generate_folded_session_memory(transcript)
+        memory = await self._generate_folded_session_memory(transcript, previous_memory)
         if memory is None:
             return False
         self._notify_fold_observer(trigger, transcript, memory)
@@ -1101,10 +1104,11 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         if len (self._openai_messages)<4:
             return False
         system_msg = self._openai_messages[0]
-        transcript = build_openai_transcript(_sanitize_for_utf8(self._openai_messages))
+        previous_memory, messages = split_previous_memory(_sanitize_for_utf8(self._openai_messages))
+        transcript = build_openai_transcript(messages)
         if not transcript.strip():
             return False
-        memory = await self._generate_folded_session_memory(transcript)
+        memory = await self._generate_folded_session_memory(transcript, previous_memory)
         if memory is None:
             return False
         self._notify_fold_observer(trigger, transcript, memory)
@@ -1119,14 +1123,14 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._refresh_runtime_system_prompt()
         return True
 
-    async def _generate_folded_session_memory(self, transcript: str) -> dict[str, Any] | None:
+    async def _generate_folded_session_memory(self, transcript: str, previous_memory: str | None = None) -> dict[str, Any] | None:
         try:
             parallel = self.fold_memory_mode == "three_parallel"
             side_query = self._build_side_query(max_tokens=2500 if parallel else 6000, require_complete=True)
             if side_query is None:
                 raise ValueError("No model client available for compaction")
             if parallel:
-                prompt = "Extract the requested memory from this conversation.\n\nConversation transcript:\n" + transcript
+                prompt = build_component_user_prompt(transcript, previous_memory)
                 names = tuple(FOLD_COMPONENT_SYSTEMS)
                 results = await asyncio.gather(
                     *(side_query(FOLD_COMPONENT_SYSTEMS[name], prompt) for name in names),
@@ -1137,7 +1141,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                         raise result
                 memory = {name: parse_fold_component(name, raw) for name, raw in zip(names, results)}
                 return parse_folded_memory(json.dumps(memory))
-            raw = await side_query(FOLD_SESSION_MEMORY_SYSTEM, build_folding_user_prompt(transcript))
+            raw = await side_query(FOLD_SESSION_MEMORY_SYSTEM, build_folding_user_prompt(transcript, previous_memory))
             return parse_folded_memory(raw)
         except Exception as exc:
             logging.warning("Compaction failed; retaining original conversation: %s", exc)

@@ -5,6 +5,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
+import re
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -12,6 +13,14 @@ from unittest.mock import AsyncMock, patch
 
 from agents.agent import Agent
 from agents.eval_folding import _run_case, extract_answer, load_cases, main_async, score_answer, score_details, summarize
+from agents.session_memory import (
+    FOLD_COMPONENT_SYSTEMS,
+    MAX_BLOCK_CHARS,
+    build_anthropic_transcript,
+    build_folding_user_prompt,
+    format_folded_memory,
+    split_previous_memory,
+)
 
 
 class FoldingSwitchTests(unittest.TestCase):
@@ -278,6 +287,140 @@ class FoldingResultTests(unittest.TestCase):
             ))
         self.assertEqual(row["status"], "truncated")
         self.assertFalse(row["correct"])
+
+
+class FoldingPromptTests(unittest.TestCase):
+    def test_first_fold_prompt_is_unchanged_without_previous_memory(self) -> None:
+        self.assertEqual(
+            build_folding_user_prompt("## Message 0 (user)\nhi"),
+            "Compact the following coding-agent conversation into the required structured session memory JSON.\n\n"
+            "Conversation transcript:\n## Message 0 (user)\nhi",
+        )
+
+    def test_first_fold_parallel_prompt_is_unchanged_without_previous_memory(self) -> None:
+        agent = Agent(api_base="http://example.test/v1", api_key="test", fold_memory_mode="three_parallel")
+        prompts = []
+        responses = iter([
+            '{"task_description":"task","key_events":[],"current_progress":""}',
+            '{"immediate_goal":"","current_challenges":"","next_actions":[]}',
+            '{"tools_used":[],"derived_rules":[]}',
+        ])
+        async def side_query(system, prompt):
+            prompts.append(prompt)
+            return next(responses)
+        with patch.object(agent, "_build_side_query", return_value=side_query):
+            asyncio.run(agent._generate_folded_session_memory("T"))
+        self.assertEqual(prompts, ["Extract the requested memory from this conversation.\n\nConversation transcript:\nT"] * 3)
+
+    def test_split_previous_memory_handles_both_protocols(self) -> None:
+        memory = _memory("task", [_event("1", "first event")])
+        folded = {"role": "user", "content": format_folded_memory(memory)}
+        later = [{"role": "assistant", "content": "a"}, {"role": "user", "content": "b"}]
+        previous, rest = split_previous_memory([folded, *later])
+        self.assertEqual(json.loads(previous), memory)
+        self.assertEqual(rest, later)
+        system = {"role": "system", "content": "sys"}
+        previous, rest = split_previous_memory([system, folded, *later])
+        self.assertEqual(json.loads(previous), memory)
+        self.assertEqual(rest, [system, *later])
+        plain = [{"role": "user", "content": "hello"}, *later]
+        self.assertEqual(split_previous_memory(plain), (None, plain))
+
+    def test_long_previous_memory_reaches_prompt_unclipped(self) -> None:
+        events = [_event(str(i), f"event {i} " + "x" * 300) for i in range(60)]
+        memory = _memory("task", events)
+        self.assertGreater(len(format_folded_memory(memory)), MAX_BLOCK_CHARS)
+        previous, rest = split_previous_memory([{"role": "user", "content": format_folded_memory(memory)}])
+        prompt = build_folding_user_prompt(build_anthropic_transcript(rest), previous)
+        self.assertNotIn("clipped", prompt)
+        self.assertIn("event 59 ", prompt)
+        self.assertIn("<previous-memory>", prompt)
+
+
+def _event(step: str, description: str) -> dict[str, str]:
+    return {"step": step, "description": description, "outcome": "ok"}
+
+
+def _memory(task: str, events: list[dict[str, str]]) -> dict:
+    return {
+        "episode_memory": {"task_description": task, "key_events": events, "current_progress": ""},
+        "working_memory": {"immediate_goal": "continue", "current_challenges": "", "next_actions": []},
+        "tool_memory": {"tools_used": [], "derived_rules": []},
+    }
+
+
+class IncrementalFoldTests(unittest.TestCase):
+    """Two consecutive folds: events from the first memory must survive into the second.
+
+    The fake model only keeps events it can see in the prompt it is given, so it stands in for a
+    summariser that drops whatever is not in front of it. Before #1 the first memory was clipped into
+    the transcript as an ordinary message; now it must arrive whole inside <previous-memory>.
+    """
+
+    def _fake_model(self, prompts: list[str]):
+        async def side_query(system, prompt):
+            prompts.append(prompt)
+            seen = re.findall(r"EVENT-[A-Z]+", prompt)
+            events = [_event(str(i), name) for i, name in enumerate(dict.fromkeys(seen))]
+            if system in FOLD_COMPONENT_SYSTEMS.values():
+                name = next(key for key, value in FOLD_COMPONENT_SYSTEMS.items() if value == system)
+                return json.dumps(_memory("task", events)[name])
+            return json.dumps(_memory("task", events))
+        return side_query
+
+    def _run_two_folds(self, *, use_openai: bool, mode: str) -> tuple[Agent, list[str]]:
+        kwargs = {"api_base": "http://example.test/v1"} if use_openai else {"api_protocol": "anthropic"}
+        agent = Agent(api_key="test", fold_memory_mode=mode, **kwargs)
+        messages = agent._openai_messages if use_openai else agent._anthropic_messages
+        messages.extend([
+            {"role": "user", "content": "start EVENT-ALPHA"},
+            {"role": "assistant", "content": "did EVENT-BETA"},
+            {"role": "user", "content": "go on"},
+            {"role": "assistant", "content": "ok"},
+        ])
+        prompts: list[str] = []
+        with patch.object(agent, "_build_side_query", return_value=self._fake_model(prompts)), \
+                patch("agents.agent.save_folded_session_memory"):
+            self.assertTrue(asyncio.run(agent._compact_conversation()))
+            messages = agent._openai_messages if use_openai else agent._anthropic_messages
+            messages.extend([
+                {"role": "user", "content": "now EVENT-GAMMA"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "next"},
+            ])
+            self.assertTrue(asyncio.run(agent._compact_conversation()))
+        return agent, prompts
+
+    def _assert_first_events_survive(self, agent: Agent, prompts: list[str], calls_per_fold: int) -> None:
+        first = agent._folded_session_memories[0]["episode_memory"]["key_events"]
+        second = agent._folded_session_memories[1]["episode_memory"]["key_events"]
+        first_names = [event["description"] for event in first]
+        self.assertEqual(first_names, ["EVENT-ALPHA", "EVENT-BETA"])
+        self.assertEqual([event["description"] for event in second], first_names + ["EVENT-GAMMA"])
+        for prompt in prompts[calls_per_fold:]:
+            previous, transcript = prompt.split("</previous-memory>")
+            self.assertIn("<previous-memory>", previous)
+            for name in first_names:
+                self.assertIn(name, previous)
+            self.assertNotIn("<session-folded-memory>", transcript)
+            self.assertNotIn("EVENT-ALPHA", transcript)
+
+    def test_single_json_anthropic(self) -> None:
+        agent, prompts = self._run_two_folds(use_openai=False, mode="single_json")
+        self._assert_first_events_survive(agent, prompts, 1)
+
+    def test_single_json_openai(self) -> None:
+        agent, prompts = self._run_two_folds(use_openai=True, mode="single_json")
+        self._assert_first_events_survive(agent, prompts, 1)
+
+    def test_three_parallel_anthropic(self) -> None:
+        agent, prompts = self._run_two_folds(use_openai=False, mode="three_parallel")
+        self.assertEqual(len(prompts), 6)
+        self._assert_first_events_survive(agent, prompts, 3)
+
+    def test_three_parallel_openai(self) -> None:
+        agent, prompts = self._run_two_folds(use_openai=True, mode="three_parallel")
+        self._assert_first_events_survive(agent, prompts, 3)
 
 
 if __name__ == "__main__":
