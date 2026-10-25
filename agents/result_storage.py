@@ -25,6 +25,19 @@ def _matches_artifact(path: Path, encoded: bytes) -> bool:
         return False
 
 
+# #25：大结果预览之前的说明是 harness 文本，之后才是外部内容；拆分只在这里做，与下面的格式共用同一个常量。
+_TOO_LARGE_PREFIX = "[Result too large ("
+PREVIEW_MARKER = "Preview (up to 200 lines / 6000 characters):\n"
+
+
+def split_preview(text: str) -> tuple[str, str] | None:
+    """(harness header up to and including PREVIEW_MARKER, external preview) for a persisted large result."""
+    if not text.startswith(_TOO_LARGE_PREFIX) or PREVIEW_MARKER not in text:
+        return None
+    cut = text.index(PREVIEW_MARKER) + len(PREVIEW_MARKER)
+    return text[:cut], text[cut:]
+
+
 def persist_tool_result(tool_name: str, result: str, *, reuse_existing: bool = False) -> dict[str, str]:
     encoded = result.encode("utf-8", errors="replace")
     result = encoded.decode("utf-8")
@@ -41,9 +54,9 @@ def persist_tool_result(tool_name: str, result: str, *, reuse_existing: bool = F
         atomic_write_text(path, result)
     preview = "\n".join(result[:6000].split("\n", 200)[:200])
     summary = (
-        f"[Result too large ({size / 1024:.1f} KB, {result.count(chr(10)) + 1} lines). "
+        f"{_TOO_LARGE_PREFIX}{size / 1024:.1f} KB, {result.count(chr(10)) + 1} lines). "
         f"Full output saved to {path}. "
         "Use read_file with offset/limit to read the required lines.]\n\n"
-        f"Preview (up to 200 lines / 6000 characters):\n{preview}"
+        f"{PREVIEW_MARKER}{preview}"
     )
     return {"result": summary, "result_file": str(path)}

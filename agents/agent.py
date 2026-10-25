@@ -39,6 +39,8 @@ from agents.session_memory import (
 from agents.session import save_dropped_messages, save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
 from agents.tool_outcome import call_signature, stuck_stop_message, stuck_warning
+from agents import untrusted
+from agents.checkpoints import CURRENT_CALL
 from agents.verify_on_stop import (
     is_harness_injected_message, is_successful_write, is_verification, load_verify_command_keywords,
     verify_on_stop_prompt,
@@ -400,6 +402,9 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
 
         #构建系统提示词
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
+        if custom_system_prompt and untrusted.WRAP_ENABLED:
+            # #25：custom prompt（子 agent、skill fork、脚本）不经过模板，说明在这里追加，只在包裹开启时
+            self._base_system_prompt = f"{custom_system_prompt}\n\n{untrusted.TOOL_OUTPUT_NOTE}"
 
         if self.permission_mode == "plan":
             self._plan_file_path = self._generate_plan_file_path()
@@ -1270,6 +1275,11 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             print_info("model_context_window_exceeded: conversation compacted, retrying this turn.")
         return True
 
+    def _wrap_result(self, call_id: str, tool_name: str, result: str) -> str:
+        """#25: last step before a tool result enters the history; decisions already read the unwrapped text."""
+        record = self._tool_checkpoints.get(call_id, {})
+        return untrusted.wrap_tool_output(tool_name, result, skill_fork=bool(record.get("skill_fork")))
+
     def _is_user_text_message(self, msg: dict) -> bool:
         if msg.get("role") != "user" or is_harness_injected_message(msg):
             return False
@@ -1606,6 +1616,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return f"Unknown skill: {inp.get('skill_name', '')}"
 
         if result["context"] == "fork":
+            # #25：fork 返回的是子 agent 的输出（外部数据），inline 返回的是 skill 指令；记在 checkpoint 上供包裹判断
+            self._tool_checkpoints.get(CURRENT_CALL.get(), {})["skill_fork"] = True
             allowed_tools = result.get("allowed_tools")
             tools = self.tools if allowed_tools is None else [
                 tool for tool in self.tools if tool["name"] in allowed_tools
@@ -1958,7 +1970,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 print_tool_result(tu.name, res)
                 warning = self._track_progress(tu.id, tu.name, inp)
                 self._record_verify_ledger(tu.name, inp, res)
-                res += warning
+                res = self._wrap_result(tu.id, tu.name, res) + warning  # #25：包裹在判定之后，警告在包裹之外
 
                 if self._context_cleared:
                     # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
@@ -2200,7 +2212,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                             warning = self._track_progress(ct_item["tc"]["id"], ct_item["fn"], ct_item["inp"],
                                                            ct_item["tc"]["function"].get("arguments"))
                             self._record_verify_ledger(ct_item["fn"], ct_item["inp"], res)
-                            res += warning
+                            res = self._wrap_result(ct_item["tc"]["id"], ct_item["fn"], res) + warning
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                     else:
@@ -2212,7 +2224,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                             warning = self._track_progress(ct["tc"]["id"], ct["fn"], ct["inp"],
                                                            ct["tc"]["function"].get("arguments"))
                             self._record_verify_ledger(ct["fn"], ct["inp"], res)
-                            res += warning
+                            res = self._wrap_result(ct["tc"]["id"], ct["fn"], res) + warning
 
                             if self._context_cleared:
                                 self._context_cleared = False

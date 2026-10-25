@@ -77,7 +77,8 @@ class ToolCheckpoints:
                     # Older sessions stored raw output. Migrate only when it is
                     # recovered, without injecting the entire artifact again.
                     record.update(persist_tool_result(record.get("name", "tool"), record["result"], reuse_existing=True))
-                    result = record["result"]
+                    # #25：插回历史的外部内容同样包裹（第四个追加位置）；下面两种恢复文案是 harness 文本，不包
+                    result = self._wrap_result(call_id, record.get("name", "tool"), record["result"])
                 elif record.get("status") == "not_started":
                     result = "Tool execution skipped: interrupted before execution; this tool was not started."
                 else:

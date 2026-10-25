@@ -20,6 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .agent import Agent
 from .checkpoints import CURRENT_CALL
+from .untrusted import strip_tool_output_tags
 from .config import (
     load_env_file as _load_env_file,
     resolve_api_config as _resolve_api_config,
@@ -115,7 +116,8 @@ def history_entries(data: dict) -> list[dict]:
                 if block.get("type") == "tool_use":
                     calls.append({"id": block.get("id"), "function": {"name": block.get("name"), "arguments": block.get("input")}})
                 if block.get("type") == "tool_result" and block.get("tool_use_id") in tools:
-                    tools[block["tool_use_id"]].update(result=text_content(block.get("content"))[:16000], status="done")
+                    result = strip_tool_output_tags(text_content(block.get("content")))  # #25：只为显示剥标签
+                    tools[block["tool_use_id"]].update(result=result[:16000], status="done")
         for call in calls:
             fn = call.get("function", {})
             args = fn.get("arguments", {})
@@ -128,7 +130,7 @@ def history_entries(data: dict) -> list[dict]:
             entries.append(entry)
             tools[entry["id"]] = entry
         if role == "tool" and msg.get("tool_call_id") in tools:
-            tools[msg["tool_call_id"]]["result"] = text[:16000]
+            tools[msg["tool_call_id"]]["result"] = strip_tool_output_tags(text)[:16000]
     return entries
 
 

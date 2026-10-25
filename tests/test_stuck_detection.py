@@ -55,6 +55,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agents.tool_outcome import STUCK_WARNING_MARKER, call_signature, is_tool_failure, result_digest
+from agents.untrusted import strip_tool_output_tags as unwrap
 
 MISSING = ("read_file", {"file_path": "missing.txt"}, "Error reading file: [Errno 2] No such file or directory: 'missing.txt'")
 
@@ -188,7 +189,9 @@ class StuckLoopTests(LoopBase):
             await self.drive(agent, [[MISSING], [MISSING], [MISSING], "I give up."])
             results = self.results(agent)
             self.assertNotIn(STUCK_WARNING_MARKER, results[1])
-            self.assertTrue(results[2].startswith(MISSING[2]))
+            # #25: results are wrapped before the warning is appended; compare the unwrapped body exactly
+            body, warning = results[2].split("\n\n" + STUCK_WARNING_MARKER, 1)
+            self.assertEqual(unwrap(body), MISSING[2])
             self.assertIn("\n\n" + STUCK_WARNING_MARKER, results[2])
             self.assertIn("stuck", self.out.getvalue().lower())
         await self.both(check)

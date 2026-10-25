@@ -291,7 +291,10 @@ class StateFixTests(unittest.TestCase):
         data['metadata']['apiProtocol'] = 'openai'
         with redirect_stdout(io.StringIO()):
             a.restore_session(data)
-        self.assertEqual(a._openai_messages[0]['content'], 'test')
+        # #25: the custom prompt now carries the tool-output note; the point is that the current prompt is kept
+        self.assertEqual(a._openai_messages[0]['content'], a._system_prompt)
+        self.assertTrue(a._openai_messages[0]['content'].startswith('test'))
+        self.assertNotIn('old prompt', a._openai_messages[0]['content'])
         self.assertEqual(a._fold_count, 1)
         asyncio.run(a.aclose())
 
