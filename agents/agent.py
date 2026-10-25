@@ -38,6 +38,10 @@ from agents.session_memory import (
 )
 from agents.session import save_dropped_messages, save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
+from agents.verify_on_stop import (
+    is_harness_injected_message, is_successful_write, is_verification, load_verify_command_keywords,
+    verify_on_stop_prompt,
+)
 from agents.tools import (
     FileVersion, ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS,
     check_permission, get_active_tool_definitions,
@@ -323,6 +327,13 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._tool_error_streak: int = 0
         self._same_tool_repeat_count: int = 0
         self._last_tool_name: str = ""
+        # verify-on-stop (#3) 本轮账本：单调序号，最后一次成功写 / 最后一次验证的序号。
+        self._tool_seq: int = 0
+        self._last_write_seq: int = 0
+        self._last_verify_seq: int = 0
+        self._turn_written_files: list[str] = []
+        self._verify_guard_fired: bool = False
+        self._verify_keywords: tuple[str, ...] = ()
 
         #构建系统提示词
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
@@ -644,6 +655,36 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             self._tool_error_streak = 0
         else:
             self._tool_error_streak += 1
+
+    def _reset_verify_ledger(self) -> None:
+        self._tool_seq = self._last_write_seq = self._last_verify_seq = 0
+        self._turn_written_files = []
+        self._verify_guard_fired = False
+        self._verify_keywords = load_verify_command_keywords()
+
+    def _record_verify_ledger(self, tool_name: str, inp: Any, result: str) -> None:
+        self._tool_seq += 1
+        inp = dict(inp) if hasattr(inp, "items") else inp
+        # plan mode 下的写（plan 文件）不入账：同一轮先写 plan 再 exit_plan_mode 后停下，不该被要求验证。
+        if is_successful_write(tool_name, result) and self.permission_mode != "plan":
+            self._last_write_seq = self._tool_seq
+            path = str((inp or {}).get("file_path") or "?")
+            if path not in self._turn_written_files:
+                self._turn_written_files.append(path)
+        elif is_verification(tool_name, inp, result, self._verify_keywords):
+            self._last_verify_seq = self._tool_seq
+
+    def _take_verify_on_stop_prompt(self) -> str | None:
+        """Prompt to append when the model stops with unverified writes; at most once per turn."""
+        if (self._verify_guard_fired or self._aborted or self.permission_mode == "plan"
+                or self.last_finish_reason not in {"end_turn", "stop"}
+                or self._last_write_seq <= self._last_verify_seq):
+            return None
+        self._verify_guard_fired = True
+        if not self.is_sub_agent:
+            print_info(f"verify-on-stop: files changed without a test/lint run afterwards "
+                       f"({', '.join(self._turn_written_files)}) — asking the model to verify before finishing.")
+        return verify_on_stop_prompt(self._turn_written_files)
 
     def _record_fold_event(self) -> None:
         self._fold_last_time = time.time()
@@ -1123,7 +1164,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         raise error
 
     def _is_user_text_message(self, msg: dict) -> bool:
-        if msg.get("role") != "user":
+        if msg.get("role") != "user" or is_harness_injected_message(msg):
             return False
         return self.use_openai or not self._anthropic_tool_result_ids(msg)
 
@@ -1574,6 +1615,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return
         user_message = _safe_utf8_text(await self._recall_before_response(user_message))
         # 先把本轮用户输入放入 Anthropic 消息历史，后续每轮模型调用都会带上这段上下文。
+        self._reset_verify_ledger()
         self._anthropic_messages.append({"role": "user", "content": user_message})
 
         while True:
@@ -1623,8 +1665,16 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 "content": [self._block_to_dict(b) for b in response.content],
             })
 
+            # #38（未实现）：stop_reason == "model_context_window_exceeded" 的比对放在这里，
+            # 先于下面的 verify-on-stop 与截断守卫：不完整的响应应先压缩重试，而不是被要求验证。
+
             # 没有工具调用，说明模型已经给出最终回复，本轮对话结束。
             if not tool_uses:
+                # verify-on-stop（#3）：本轮成功写过文件、之后没跑验证 → 追加提示继续，每轮至多一次。
+                guard = self._take_verify_on_stop_prompt()
+                if guard:
+                    self._anthropic_messages.append({"role": "user", "content": guard})
+                    continue
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens + self.side_input_tokens, self.total_output_tokens + self.side_output_tokens,
                                self.input_price_per_million, self.output_price_per_million)
@@ -1670,6 +1720,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 res = await self._run_tracked_tool(tu.id, tu.name, inp)
                 print_tool_result(tu.name, res)
                 self._record_tool_outcome(tu.name, not self._tracked_tool_failed(tu.id, tu.name, res))
+                self._record_verify_ledger(tu.name, inp, res)
 
                 if self._context_cleared:
                     # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
@@ -1791,6 +1842,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             self._emit_text(f"Budget exceeded: {budget['reason']}")
             return
         user_message = _safe_utf8_text(await self._recall_before_response(user_message))
+        self._reset_verify_ledger()
         self._openai_messages.append({"role": "user", "content": user_message})
 
         while True:
@@ -1836,7 +1888,13 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
 
             tool_calls = message.get("tool_calls")
 
+            # #38（未实现）：finish_reason 的上下文溢出比对放在这里，先于 verify-on-stop 与截断守卫。
             if not tool_calls:
+                # verify-on-stop（#3）：同 _chat_anthropic。
+                guard = self._take_verify_on_stop_prompt()
+                if guard:
+                    self._openai_messages.append({"role": "user", "content": guard})
+                    continue
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens + self.side_input_tokens, self.total_output_tokens + self.side_output_tokens,
                                self.input_price_per_million, self.output_price_per_million)
@@ -1890,6 +1948,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                                 ct_item["fn"],
                                 not self._tracked_tool_failed(ct_item["tc"]["id"], ct_item["fn"], res),
                             )
+                            self._record_verify_ledger(ct_item["fn"], ct_item["inp"], res)
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                     else:
@@ -1902,6 +1961,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                                 ct["fn"],
                                 not self._tracked_tool_failed(ct["tc"]["id"], ct["fn"], res),
                             )
+                            self._record_verify_ledger(ct["fn"], ct["inp"], res)
 
                             if self._context_cleared:
                                 self._context_cleared = False

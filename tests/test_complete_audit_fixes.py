@@ -52,7 +52,10 @@ class CompleteAuditRuntimeTests(unittest.IsolatedAsyncioTestCase):
         return agent
 
     async def run_calls(self, agent, protocol, calls, finish=None):
-        setattr(agent, "_call_" + protocol + "_stream", AsyncMock(side_effect=[response(protocol, calls, finish), response(protocol)]))
+        # The third response is for the verify-on-stop guard's continuation (#3): a successful write followed by a
+        # stop triggers one extra model call. Sub-tests that do not trigger the guard never reach it — do not remove.
+        setattr(agent, "_call_" + protocol + "_stream", AsyncMock(side_effect=[
+            response(protocol, calls, finish), response(protocol), response(protocol)]))
         with patch("agents.tools._check_permission_rules", return_value=None), redirect_stdout(io.StringIO()):
             await agent.chat("task")
 
@@ -240,10 +243,12 @@ class CompleteAuditRuntimeTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(protocol=protocol, incomplete=incomplete), tempfile.TemporaryDirectory() as tmp:
                 target = Path(tmp) / "sdk.txt"
                 call_count = 0
+                bodies = []
                 def handler(request):
                     nonlocal call_count
                     call_count += 1
                     body = json.loads(request.content)
+                    bodies.append(body)
                     self.assertTrue(body["stream"])
                     if protocol == "openai":
                         message = ({"role": "assistant", "tool_calls": [{"index": 0, "id": "call", "type": "function", "function": {
@@ -285,7 +290,10 @@ class CompleteAuditRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(agent.last_finish_reason, "incomplete")
                 else:
                     self.assertEqual(target.read_text(), "SDK verified")
-                    self.assertEqual(call_count, 2)
+                    # write → stop → verify-on-stop guard (#3) → stop again → exit: exactly one guard continuation.
+                    self.assertEqual(call_count, 3)
+                    self.assertIn("[verify-on-stop]", json.dumps(bodies[2]["messages"][-1]))
+                    self.assertNotIn("[verify-on-stop]", json.dumps(bodies[1]))
 
 
 class CompleteAuditDataTests(unittest.IsolatedAsyncioTestCase):
