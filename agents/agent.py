@@ -84,6 +84,9 @@ def _is_context_overflow(error: Exception) -> bool:
 # SDK 0.97 非 beta 的 StopReason 字面量里没有它，但流式累积直接赋值，原字符串能到达（2026-10-25 离线探针实测），用字符串比较。
 ANTHROPIC_CONTEXT_WINDOW_EXCEEDED = "model_context_window_exceeded"
 
+# #41：本轮请求估算超过窗口这一比例时不必构造折叠后历史再估，直接不放回（真正的判据是折叠后的估算）。
+TURN_REQUEST_PRECHECK_FRACTION = 0.25
+
 OVERFLOW_FALLBACK_ROUNDS = 2
 OVERFLOW_KEEP_FRACTION = 0.5
 OVERFLOW_MARKER_TEXT = "[Context overflow: {n} earlier messages were dropped to fit the context window; their content is no longer available.]"
@@ -340,6 +343,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._verify_keywords: tuple[str, ...] = ()
         # #38：本轮是否已处理过 model_context_window_exceeded（每轮一次机会）。
         self._overflow_stop_handled: bool = False
+        # #41：本轮请求消息对象（_chat_* 追加时记下，chat() 结束清空）；折叠时按对象身份放回记忆块之后。
+        self._turn_request: dict | None = None
 
         #构建系统提示词
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
@@ -536,6 +541,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 raise
         finally:
             self._repair_interrupted_tool_calls()
+            self._turn_request = None
             self._current_task = None
             self._turn_output_buffer = None
             if not self.is_sub_agent:
@@ -1267,13 +1273,11 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         memory = await self._generate_folded_session_memory(transcript, previous_memory)
         if memory is None:
             return False
+        kept = self._messages_kept_after_fold()
         self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
-        self._anthropic_messages = [{"role": "user", "content": format_folded_memory(memory)}]
-        self.last_input_token_count = 0
-        self._last_request_bytes = None
-        self._refresh_runtime_system_prompt()
+        self._install_folded_history([{"role": "user", "content": format_folded_memory(memory)}], kept)
         return True
 
     async def _compact_openai(self, *, trigger: str)->bool:
@@ -1287,17 +1291,48 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         memory = await self._generate_folded_session_memory(transcript, previous_memory)
         if memory is None:
             return False
+        kept = self._messages_kept_after_fold()
         self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
-        self._openai_messages=[
-            system_msg,
-            {"role": "user", "content": format_folded_memory(memory)},
-        ]
-        self.last_input_token_count=0
+        self._install_folded_history([system_msg, {"role": "user", "content": format_folded_memory(memory)}], kept)
+        return True
+
+    #折叠后保留的原文（#41；#4 的「保留最近 K 条」在这里扩展，不要另写一套）
+    def _messages_kept_after_fold(self) -> list[dict]:
+        request = self._turn_request
+        if request is None:  # 两轮之间（/compact、eval_scheduled）或历史被有意清空：无可保留
+            return []
+        messages = self._openai_messages if self.use_openai else self._anthropic_messages
+        if not any(m is request for m in messages):
+            # 某处重建了消息 dict：#41 会静默失效，必须可见。
+            logging.warning("turn request lost before fold; keeping folded memory only")
+            return []
+        size = (len(json.dumps(request, ensure_ascii=False, default=str).encode("utf-8", errors="replace")) + 2) // 3
+        if size > self.effective_window * TURN_REQUEST_PRECHECK_FRACTION:
+            print_info("Current request is too large to keep verbatim after folding; it is only in the folded memory.")
+            return []
+        return [request]
+
+    def _install_folded_history(self, prefix: list[dict], kept: list[dict]) -> None:
+        messages = prefix + kept
+        if self.use_openai:
+            self._openai_messages = messages
+        else:
+            self._anthropic_messages = messages
+        self.last_input_token_count = 0
         self._last_request_bytes = None
         self._refresh_runtime_system_prompt()
-        return True
+        # 用阈值折叠同一把尺（_check_and_compact 的估算与阈值）复核：放回后仍达阈值就不放回，折叠循环在结构上不可能。
+        if kept and self._estimated_input_tokens() >= self.effective_window * self.auto_compact_threshold:
+            del messages[len(prefix):]
+            print_info("Current request is too large to keep verbatim after folding; it is only in the folded memory.")
+
+    def _append_context_reset_message(self, content: str) -> None:
+        msg = {"role": "user", "content": content}
+        (self._openai_messages if self.use_openai else self._anthropic_messages).append(msg)
+        if self._turn_request is None:  # 计划批准后清空了历史：这条消息（含已批准计划）就是本轮新的请求
+            self._turn_request = msg
 
     async def _generate_folded_session_memory(self, transcript: str, previous_memory: str | None = None) -> dict[str, Any] | None:
         try:
@@ -1523,6 +1558,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         """清空历史信息，但是保留系统prompt."""
         self._anthropic_messages = []
         self._openai_messages = []
+        self._turn_request = None  # 有意清空历史：本轮请求合法缺席，由随后的重置消息接替
         if self.use_openai:
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
         self.last_input_token_count = 0
@@ -1637,7 +1673,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         # 先把本轮用户输入放入 Anthropic 消息历史，后续每轮模型调用都会带上这段上下文。
         self._reset_verify_ledger()
         self._overflow_stop_handled = False
-        self._anthropic_messages.append({"role": "user", "content": user_message})
+        self._turn_request = {"role": "user", "content": user_message}
+        self._anthropic_messages.append(self._turn_request)
 
         while True:
             # 外部请求中止时，结束整个 agent loop。
@@ -1753,7 +1790,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                     # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
                     # 并停止继续处理本轮剩余工具，避免旧上下文和新上下文混在一起。
                     self._context_cleared = False
-                    self._anthropic_messages.append({"role": "user", "content": res})
+                    self._append_context_reset_message(res)
                     context_break = True
                     break
 
@@ -1870,7 +1907,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return
         user_message = _safe_utf8_text(await self._recall_before_response(user_message))
         self._reset_verify_ledger()
-        self._openai_messages.append({"role": "user", "content": user_message})
+        self._turn_request = {"role": "user", "content": user_message}
+        self._openai_messages.append(self._turn_request)
 
         while True:
             if self._aborted:
@@ -1992,7 +2030,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
 
                             if self._context_cleared:
                                 self._context_cleared = False
-                                self._openai_messages.append({"role": "user", "content": res})
+                                self._append_context_reset_message(res)
                                 oai_context_break = True
                                 break
 

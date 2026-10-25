@@ -105,8 +105,10 @@ class OverflowStopLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent._fold_count, 1)
         self.assertEqual(agent._folded_session_memories[-1]["trigger"], "overflow_stop")
         retry_request = seen[1]
-        self.assertEqual(len(retry_request), 1)  # only the folded-memory block: truncated reply never entered history
+        # folded-memory block + this turn's request (kept by #41); the truncated reply never entered history
+        self.assertEqual(len(retry_request), 2)
         self.assertTrue(retry_request[0]["content"].startswith("<session-folded-memory>"))
+        self.assertEqual(retry_request[1], {"role": "user", "content": "do the task"})
         self.assertNotIn("PARTIAL ANSWER", self.texts(agent._anthropic_messages))
         self.assertEqual(agent._turn_output_buffer, ["FULL ANSWER"])  # buffer cut back before the retry
         self.assertEqual(agent._anthropic_messages[-1]["content"], [{"type": "text", "text": "FULL ANSWER"}])
