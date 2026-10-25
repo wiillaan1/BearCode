@@ -197,8 +197,10 @@ cython_debug/
 .teams/
 .bear/skill-evolution/
 .bear/folding-eval/
+.bear/overflow-e2e/
 .bear/sessions/*.folded-memory.jsonl
 .bear/sessions/*.folded-memory.latest.json
+.bear/sessions/*.dropped.jsonl
 .bear/sessions/*.lock
 .bear/skills/**/*.lock
 
