@@ -47,6 +47,8 @@ class RuntimeBoundariesTests(unittest.IsolatedAsyncioTestCase):
                        enable_mcp=False, enable_memory_prefetch=False, enable_online_evolution=False,
                        enable_folding=False)
         options.update(kwargs)
+        # #4: these histories are tiny and would sit entirely in the default verbatim tail (no fold); tail-on is covered in test_fold_tail.py
+        options.setdefault("fold_tail_tokens", 0)
         agent = Agent(**options)
         self.addAsyncCleanup(agent.aclose)
         return agent

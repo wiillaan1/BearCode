@@ -52,6 +52,8 @@ class Base(unittest.IsolatedAsyncioTestCase):
                        enable_online_evolution=False, enable_folding=True, model="gpt-4o")
         options.update({"api_base": "https://example.test/v1"} if use_openai else {"api_protocol": "anthropic"})
         options.update(kwargs)
+        # #4: these histories are tiny and would sit entirely in the default verbatim tail (no fold); tail-on is covered in test_fold_tail.py
+        options.setdefault("fold_tail_tokens", 0)
         agent = Agent(**options)
         agent._auto_save = lambda strict=False: None
         self.transcripts = []

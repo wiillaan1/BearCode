@@ -11,6 +11,15 @@ from .memory import (MAX_SESSION_MEMORY_BYTES, start_memory_prefetch,
 from .tool_results import compact_tool_results
 
 
+def tokens_from_bytes(size: int) -> int:
+    # Conservative heuristic (~3 bytes per token), not an exact tokenizer; the one ruler for every context estimate.
+    return (size + 2) // 3
+
+
+def estimate_tokens(value) -> int:
+    return tokens_from_bytes(len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8", errors="replace")))
+
+
 class ContextRuntime:
     def _run_compression_pipeline(self) -> None:
         messages = self._openai_messages if self.use_openai else self._anthropic_messages
@@ -60,7 +69,7 @@ class ContextRuntime:
         size = self._context_request_bytes()
         anchor = self._last_request_bytes
         growth = max(0, size - anchor) if anchor is not None else 0
-        return max((size + 2) // 3, self.last_input_token_count + (growth + 2) // 3)
+        return max(tokens_from_bytes(size), self.last_input_token_count + tokens_from_bytes(growth))
 
     async def _prepare_model_context(self) -> None:
         self._run_compression_pipeline()

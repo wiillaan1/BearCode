@@ -18,7 +18,7 @@ import openai
 from agents.mcp_client import BorrowedMcpManager, McpManager
 from .background_jobs import BackgroundSkillTasks
 from .tool_runtime import ToolExecution
-from .context_runtime import ContextRuntime
+from .context_runtime import ContextRuntime, estimate_tokens
 from .streaming import StreamAttempts
 from .checkpoints import ToolCheckpoints
 from agents.memory import MemoryPrefetch
@@ -83,6 +83,18 @@ def _is_context_overflow(error: Exception) -> bool:
 # #38：Claude 4.5+ 输入 + max_tokens 超窗口时请求被接受、生成撞窗口后以此 stop_reason 正常结束（不抛异常）。
 # SDK 0.97 非 beta 的 StopReason 字面量里没有它，但流式累积直接赋值，原字符串能到达（2026-10-25 离线探针实测），用字符串比较。
 ANTHROPIC_CONTEXT_WINDOW_EXCEEDED = "model_context_window_exceeded"
+
+# #4：折叠后保留的原文尾部。默认预算 min(20K, 窗口 20%)，以估算 token 计；最终由阈值收缩裁定。
+FOLD_TAIL_DEFAULT_TOKENS = 20_000
+FOLD_TAIL_DEFAULT_FRACTION = 0.20
+# 折叠 side query 的输出上限（三路并行每路 / 单路）。
+FOLD_COMPONENT_MAX_TOKENS = 2500
+FOLD_SINGLE_MAX_TOKENS = 6000
+# 摘要之前为记忆块预留的估算 token，用来给尾部定大小（摘要前不知道记忆多大）。
+# 校准（2026-10-25）：.bear/folding-eval 与 .bear/sessions 中 145 条已存折叠记忆，estimate_tokens 最大 2326、
+# p90 2004、中位 1327；全为英文短用例（gpt-4.1 / gpt-4o-mini），无中文样本（bytes/3 对中文偏高），长会话下会更大。
+# 取观测最大值 × 2，且不超过理论上界（输出顶满 × 4 字符/token ÷ 3）。偏小的代价只是安全复核打印一行、下次折叠吸收。
+FOLD_MEMORY_RESERVE_TOKENS = min(2 * 2326, max(3 * FOLD_COMPONENT_MAX_TOKENS, FOLD_SINGLE_MAX_TOKENS) * 4 // 3)
 
 # #41：本轮请求估算超过窗口这一比例时不必构造折叠后历史再估，直接不放回（真正的判据是折叠后的估算）。
 TURN_REQUEST_PRECHECK_FRACTION = 0.25
@@ -203,6 +215,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                  is_sub_agent: bool=False,
                  enable_folding: bool=True,
                  max_fold_limit: int | None=None,
+                 fold_tail_tokens: int | None=None,
                  fold_memory_mode: str="single_json",
                  auto_compact_threshold: float=AUTO_COMPACT_THRESHOLD,
                  enable_memory_prefetch: bool=True,
@@ -214,6 +227,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             raise ValueError("auto_compact_threshold must be between 0 and 1")
         if max_fold_limit is not None and max_fold_limit < 0:
             raise ValueError("max_fold_limit must be non-negative")
+        if fold_tail_tokens is not None and fold_tail_tokens < 0:
+            raise ValueError("fold_tail_tokens must be non-negative")
         if fold_memory_mode not in {"single_json", "three_parallel"}:
             raise ValueError("fold_memory_mode must be single_json or three_parallel")
         if max_output_tokens is not None and max_output_tokens < 2:
@@ -242,6 +257,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._api_key = api_key
         self.enable_folding = enable_folding
         self.max_fold_limit = max_fold_limit
+        self.fold_tail_tokens = fold_tail_tokens
         self.fold_memory_mode = fold_memory_mode
         self.auto_compact_threshold = auto_compact_threshold
         if not math.isfinite(memory_recall_timeout) or memory_recall_timeout <= 0:
@@ -1194,6 +1210,25 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return False
         return self.use_openai or not self._anthropic_tool_result_ids(msg)
 
+    def _split_history_units(self, region: list[dict]) -> tuple[list[list[dict]], int | None]:
+        """Whole units of history, shared by #2 (fallback) and #4 (fold tail); cuts only at unit boundaries.
+
+        Each earlier turn (user text up to the next user text) is one unit; in the current turn (after the last user
+        text) each tool round (assistant + its results) is one unit. Tool results always join the preceding unit, so a
+        tool_use/tool_result pair is never split. Returns (units, index of the unit holding the last user text).
+        """
+        current = max((i for i, msg in enumerate(region) if self._is_user_text_message(msg)), default=-1)
+        units: list[list[dict]] = []
+        current_unit = None
+        for i, msg in enumerate(region):
+            if not units or self._is_user_text_message(msg) or (i > current and msg.get("role") == "assistant"):
+                units.append([msg])
+                if i == current:
+                    current_unit = len(units) - 1
+            else:
+                units[-1].append(msg)
+        return units, current_unit
+
     def _drop_earliest_messages(self, fallback_round: int) -> bool:
         """Drop the oldest whole units until the history is at most half its size; never splits a tool_use/tool_result pair.
 
@@ -1214,14 +1249,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 prior_dropped += int(match.group(1))
             else:
                 region.append(msg)
-        current = max((i for i, msg in enumerate(region) if self._is_user_text_message(msg)), default=-1)
-        units: list[list[dict]] = []
-        for i, msg in enumerate(region):
-            if not units or self._is_user_text_message(msg) or (i > current and msg.get("role") == "assistant"):
-                units.append([msg])
-            else:
-                units[-1].append(msg)
-        current_unit = next((k for k, unit in enumerate(units) if current >= 0 and unit[0] is region[current]), None)
+        units, current_unit = self._split_history_units(region)
         droppable = [k for k in range(len(units) - 1) if k != current_unit]
         if not droppable:
             return False
@@ -1263,58 +1291,111 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         return True
 
     async def _compact_anthropic(self, *, trigger: str)->bool:
-        if len (self._anthropic_messages)<4:
-            return False
-
-        previous_memory, messages = split_previous_memory(_sanitize_for_utf8(self._anthropic_messages))
-        transcript = build_anthropic_transcript(messages)
-        if not transcript.strip():
-            return False
-        memory = await self._generate_folded_session_memory(transcript, previous_memory)
-        if memory is None:
-            return False
-        kept = self._messages_kept_after_fold()
-        self._notify_fold_observer(trigger, transcript, memory)
-        self._record_folded_session_memory(trigger, memory)
-        self._record_fold_event()
-        self._install_folded_history([{"role": "user", "content": format_folded_memory(memory)}], kept)
-        return True
+        return await self._fold_history(trigger=trigger)
 
     async def _compact_openai(self, *, trigger: str)->bool:
-        if len (self._openai_messages)<4:
+        return await self._fold_history(trigger=trigger)
+
+    async def _fold_history(self, *, trigger: str) -> bool:
+        messages = self._openai_messages if self.use_openai else self._anthropic_messages
+        if len(messages) < 4:
             return False
-        system_msg = self._openai_messages[0]
-        previous_memory, messages = split_previous_memory(_sanitize_for_utf8(self._openai_messages))
-        transcript = build_openai_transcript(messages)
+        previous_memory, _ = split_previous_memory(_sanitize_for_utf8(messages))
+        plan = self._plan_fold(messages)
+        if plan is None:  # 头部为空：全部历史都在尾部里，没有可折的内容；不是失败
+            return False
+        transcript_messages, kept, request, tail_kept, notes = plan
+        build_transcript = build_openai_transcript if self.use_openai else build_anthropic_transcript
+        transcript = build_transcript(_sanitize_for_utf8(transcript_messages))
         if not transcript.strip():
             return False
-        memory = await self._generate_folded_session_memory(transcript, previous_memory)
+        memory = await self._generate_folded_session_memory(
+            transcript, previous_memory, **({"tail_kept": True} if tail_kept else {}))
         if memory is None:
             return False
-        kept = self._messages_kept_after_fold()
+        for level, note in notes:
+            logging.warning(note) if level == "warning" else print_info(note)
         self._notify_fold_observer(trigger, transcript, memory)
         self._record_folded_session_memory(trigger, memory)
         self._record_fold_event()
-        self._install_folded_history([system_msg, {"role": "user", "content": format_folded_memory(memory)}], kept)
+        memory_message = {"role": "user", "content": format_folded_memory(memory)}
+        prefix = [messages[0], memory_message] if self.use_openai else [memory_message]
+        self._install_folded_history(prefix, kept, request)
         return True
 
-    #折叠后保留的原文（#41；#4 的「保留最近 K 条」在这里扩展，不要另写一套）
-    def _messages_kept_after_fold(self) -> list[dict]:
-        request = self._turn_request
-        if request is None:  # 两轮之间（/compact、eval_scheduled）或历史被有意清空：无可保留
-            return []
-        messages = self._openai_messages if self.use_openai else self._anthropic_messages
-        if not any(m is request for m in messages):
-            # 某处重建了消息 dict：#41 会静默失效，必须可见。
-            logging.warning("turn request lost before fold; keeping folded memory only")
-            return []
-        size = (len(json.dumps(request, ensure_ascii=False, default=str).encode("utf-8", errors="replace")) + 2) // 3
-        if size > self.effective_window * TURN_REQUEST_PRECHECK_FRACTION:
-            print_info("Current request is too large to keep verbatim after folding; it is only in the folded memory.")
-            return []
-        return [request]
+    def _is_open_round(self, msg: dict) -> bool:
+        """An assistant message whose tool calls have no results yet (compact_context fires mid-round)."""
+        if msg.get("role") != "assistant":
+            return False
+        return bool(msg.get("tool_calls")) if self.use_openai else bool(self._anthropic_tool_use_ids(msg))
 
-    def _install_folded_history(self, prefix: list[dict], kept: list[dict]) -> None:
+    def _fold_tail_budget(self) -> int:
+        if self.fold_tail_tokens is not None:
+            return self.fold_tail_tokens
+        return min(FOLD_TAIL_DEFAULT_TOKENS, int(self.effective_window * FOLD_TAIL_DEFAULT_FRACTION))
+
+    def _plan_fold(self, messages: list[dict]):
+        """Split history into what is summarised and what is kept verbatim after the memory (#41 + #4).
+
+        Returns (transcript messages, kept messages, kept request or None, tail kept?, notes to emit once the
+        memory exists), or None when keeping the tail would leave nothing to fold.
+        """
+        _, rest = split_previous_memory(messages)  # 原对象：本轮请求按身份识别
+        region = [m for m in rest if m.get("role") != "system"]
+        kept, request, notes = self._messages_kept_after_fold(region)
+        if kept is None:
+            return None
+        kept_ids = {id(m) for m in kept if m is not request}
+        # 尾部不进 transcript（下次折叠不会把同一事件摘要两次）；本轮请求仍进，摘要知道当前目标。
+        transcript_messages = [m for m in rest if id(m) not in kept_ids]
+        return transcript_messages, kept, request, bool(kept_ids), notes
+
+    #折叠后保留的原文（#41 本轮请求 + #4 尾部；决定「折叠后留下什么」的唯一位置）
+    def _messages_kept_after_fold(self, region: list[dict]):
+        notes: list[tuple[str, str]] = []
+        request = self._turn_request
+        if request is not None and not any(m is request for m in region):
+            # 某处重建了消息 dict：#41 会静默失效，必须可见。
+            notes.append(("warning", "turn request lost before fold; keeping folded memory only"))
+            request = None
+        if request is not None and estimate_tokens(request) > self.effective_window * TURN_REQUEST_PRECHECK_FRACTION:
+            notes.append(("info", "Current request is too large to keep verbatim after folding; it is only in the folded memory."))
+            request = None
+        # 未闭合回合（compact_context 在回合中途触发）随头部折掉，尾部永不以未答的 tool call 结尾。
+        closed = region[:-1] if region and self._is_open_round(region[-1]) else region
+        tail = self._select_fold_tail(closed, request)
+        tail_ids = {id(m) for unit in tail for m in unit if m is not request}
+        if tail_ids and all(id(m) in tail_ids or m is request for m in closed):
+            return None, None, notes
+        kept = [m for m in closed if id(m) in tail_ids or m is request]
+        return kept, request, notes
+
+    def _select_fold_tail(self, closed: list[dict], request: dict | None) -> list[list[dict]]:
+        budget = self._fold_tail_budget()
+        if not budget or not closed:
+            return []
+        units, _ = self._split_history_units(closed)
+
+        def cost(unit: list[dict]) -> int:
+            return estimate_tokens([m for m in unit if m is not request])
+
+        tail: list[list[dict]] = []
+        total = 0
+        for unit in reversed(units):
+            if total + cost(unit) > budget:
+                break
+            tail.insert(0, unit)
+            total += cost(unit)
+        # 摘要之前收缩：假定请求保留、记忆按预留大小，仍达阈值就从最老的尾部单位去掉。
+        # 被去掉的单位回到头部进 transcript，不丢；请求的去留留到摘要之后用真实记忆判（_install_folded_history）。
+        fixed = (estimate_tokens([self._system_prompt, self.tools]) + FOLD_MEMORY_RESERVE_TOKENS
+                 + (estimate_tokens(request) if request is not None else 0))
+        limit = self.effective_window * self.auto_compact_threshold
+        while tail and fixed + sum(cost(unit) for unit in tail) >= limit:
+            tail.pop(0)
+        return tail
+
+    def _install_folded_history(self, prefix: list[dict], kept: list[dict], request: dict | None = None) -> None:
         messages = prefix + kept
         if self.use_openai:
             self._openai_messages = messages
@@ -1323,10 +1404,15 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self.last_input_token_count = 0
         self._last_request_bytes = None
         self._refresh_runtime_system_prompt()
-        # 用阈值折叠同一把尺（_check_and_compact 的估算与阈值）复核：放回后仍达阈值就不放回，折叠循环在结构上不可能。
-        if kept and self._estimated_input_tokens() >= self.effective_window * self.auto_compact_threshold:
-            del messages[len(prefix):]
-            print_info("Current request is too large to keep verbatim after folding; it is only in the folded memory.")
+        # 用阈值折叠同一把尺（_check_and_compact 的估算与阈值）复核，判据用真实记忆。
+        limit = self.effective_window * self.auto_compact_threshold
+        if kept and self._estimated_input_tokens() >= limit:
+            if request is not None and any(m is request for m in messages):
+                messages.remove(request)  # 请求已在 transcript 里，撤回不丢内容；尾部保留
+                print_info("Current request is too large to keep verbatim after folding; it is only in the folded memory.")
+            if len(messages) > len(prefix) and self._estimated_input_tokens() >= limit:
+                # 尾部不在 transcript 里，删掉就丢；记忆超出预留时只提示，下次折叠会把尾部吸收进记忆。
+                print_info("Folded history is still above the compaction threshold; the next fold will absorb the kept tail.")
 
     def _append_context_reset_message(self, content: str) -> None:
         msg = {"role": "user", "content": content}
@@ -1334,14 +1420,16 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         if self._turn_request is None:  # 计划批准后清空了历史：这条消息（含已批准计划）就是本轮新的请求
             self._turn_request = msg
 
-    async def _generate_folded_session_memory(self, transcript: str, previous_memory: str | None = None) -> dict[str, Any] | None:
+    async def _generate_folded_session_memory(self, transcript: str, previous_memory: str | None = None,
+                                              tail_kept: bool = False) -> dict[str, Any] | None:
         try:
             parallel = self.fold_memory_mode == "three_parallel"
-            side_query = self._build_side_query(max_tokens=2500 if parallel else 6000, require_complete=True)
+            side_query = self._build_side_query(max_tokens=FOLD_COMPONENT_MAX_TOKENS if parallel else FOLD_SINGLE_MAX_TOKENS,
+                                                require_complete=True)
             if side_query is None:
                 raise ValueError("No model client available for compaction")
             if parallel:
-                prompt = build_component_user_prompt(transcript, previous_memory)
+                prompt = build_component_user_prompt(transcript, previous_memory, tail_kept)
                 names = tuple(FOLD_COMPONENT_SYSTEMS)
                 results = await asyncio.gather(
                     *(side_query(FOLD_COMPONENT_SYSTEMS[name], prompt) for name in names),
@@ -1352,7 +1440,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                         raise result
                 memory = {name: parse_fold_component(name, raw) for name, raw in zip(names, results)}
                 return parse_folded_memory(json.dumps(memory))
-            raw = await side_query(FOLD_SESSION_MEMORY_SYSTEM, build_folding_user_prompt(transcript, previous_memory))
+            raw = await side_query(FOLD_SESSION_MEMORY_SYSTEM, build_folding_user_prompt(transcript, previous_memory, tail_kept))
             return parse_folded_memory(raw)
         except Exception as exc:
             logging.warning("Compaction failed; retaining original conversation: %s", exc)
@@ -1610,6 +1698,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                        if self.max_turns is not None else None),
             enable_folding=self.enable_folding,
             max_fold_limit=self.max_fold_limit,
+            fold_tail_tokens=self.fold_tail_tokens,
             fold_memory_mode=self.fold_memory_mode,
             auto_compact_threshold=self.auto_compact_threshold,
             enable_memory_prefetch=self.enable_memory_prefetch,

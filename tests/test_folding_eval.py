@@ -26,6 +26,8 @@ from agents.session_memory import (
 class FoldingSwitchTests(unittest.TestCase):
     def _agent(self, **kwargs) -> Agent:
         with patch("agents.agent.build_system_prompt", return_value="test system prompt"):
+            # #4: these histories are tiny and would sit entirely in the default verbatim tail (no fold); tail-on is covered in test_fold_tail.py
+            kwargs.setdefault("fold_tail_tokens", 0)
             return Agent(api_base="http://example.test/v1", api_key="test", **kwargs)
 
     def test_disabled_folding_blocks_all_entry_points(self) -> None:
@@ -243,7 +245,7 @@ class FoldingResultTests(unittest.TestCase):
             output = root / "results"
             args = SimpleNamespace(
                 cases=cases_path, output=output, text_only=False, limit=None, validate_only=False,
-                model="fake", api_base=None, fold_threshold=0.7, max_fold_limit=3,
+                model="fake", api_base=None, fold_threshold=0.7, max_fold_limit=3, fold_tail_tokens=0,
                 fold_memory_mode="three_parallel", fold_after_turn=2, max_turns=10,
                 max_output_tokens=2048, max_cost=1.0, timeout=10, score_mode="normalized",
             )
@@ -370,7 +372,8 @@ class IncrementalFoldTests(unittest.TestCase):
 
     def _run_two_folds(self, *, use_openai: bool, mode: str) -> tuple[Agent, list[str]]:
         kwargs = {"api_base": "http://example.test/v1"} if use_openai else {"api_protocol": "anthropic"}
-        agent = Agent(api_key="test", fold_memory_mode=mode, **kwargs)
+        # #4: these histories are tiny and would sit entirely in the default verbatim tail (no fold); tail-on is covered in test_fold_tail.py
+        agent = Agent(api_key="test", fold_memory_mode=mode, fold_tail_tokens=0, **kwargs)
         messages = agent._openai_messages if use_openai else agent._anthropic_messages
         messages.extend([
             {"role": "user", "content": "start EVENT-ALPHA"},

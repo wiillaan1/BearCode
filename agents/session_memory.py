@@ -179,24 +179,33 @@ def _previous_memory_section(previous_memory: str) -> str:
     )
 
 
-def build_folding_user_prompt(transcript: str, previous_memory: str | None = None) -> str:
+# #4：只在折叠后保留了原文尾部时加这段；不保留尾部时 prompt 与改前逐字相同。
+_TAIL_KEPT_NOTE = (
+    "Note: the most recent messages after this transcript are kept verbatim right after the memory and are not "
+    "shown here. Describe current_progress and immediate_goal as of the end of this transcript.\n\n"
+)
+
+
+def build_folding_user_prompt(transcript: str, previous_memory: str | None = None, tail_kept: bool = False) -> str:
+    note = _TAIL_KEPT_NOTE if tail_kept else ""
     if previous_memory is None:
-        return (
+        return note + (
             "Compact the following coding-agent conversation into the required structured session memory JSON.\n\n"
             "Conversation transcript:\n"
             f"{transcript}"
         )
-    return (
+    return note + (
         "Update the previous session memory with the coding-agent conversation that followed it, "
         "and return the required structured session memory JSON.\n\n"
         f"{_previous_memory_section(previous_memory)}{transcript}"
     )
 
 
-def build_component_user_prompt(transcript: str, previous_memory: str | None = None) -> str:
+def build_component_user_prompt(transcript: str, previous_memory: str | None = None, tail_kept: bool = False) -> str:
+    note = _TAIL_KEPT_NOTE if tail_kept else ""
     if previous_memory is None:
-        return "Extract the requested memory from this conversation.\n\nConversation transcript:\n" + transcript
-    return (
+        return note + "Extract the requested memory from this conversation.\n\nConversation transcript:\n" + transcript
+    return note + (
         "Update the requested memory from the previous session memory and the conversation that followed it.\n\n"
         f"{_previous_memory_section(previous_memory)}{transcript}"
     )

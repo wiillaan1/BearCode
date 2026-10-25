@@ -47,6 +47,8 @@ class OverflowStopLoopTests(unittest.IsolatedAsyncioTestCase):
                        enable_online_evolution=False, enable_folding=True)
         options.update({"api_base": "https://example.test/v1"} if use_openai else {"api_protocol": "anthropic"})
         options.update(kwargs)
+        # #4: these histories are tiny and would sit entirely in the default verbatim tail (no fold); tail-on is covered in test_fold_tail.py
+        options.setdefault("fold_tail_tokens", 0)
         agent = Agent(**options)
         agent._auto_save = lambda strict=False: None
         agent._turn_output_buffer = []
@@ -244,7 +246,8 @@ class OverflowStopRealSdkTests(unittest.IsolatedAsyncioTestCase):
             body = "".join("event: %s\ndata: %s\n\n" % (e["type"], json.dumps(e)) for e in events)
             return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
 
-        agent = Agent(api_key="fake", api_protocol="anthropic", custom_system_prompt="test", enable_mcp=False,
+        # #4: these histories are tiny and would sit entirely in the default verbatim tail (no fold); tail-on is covered in test_fold_tail.py
+        agent = Agent(api_key="fake", api_protocol="anthropic", custom_system_prompt="test", enable_mcp=False, fold_tail_tokens=0,
                       enable_memory_prefetch=False, enable_online_evolution=False, enable_folding=True)
         agent._auto_save = lambda strict=False: None
         await agent._anthropic_client.close()

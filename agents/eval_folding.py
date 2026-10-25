@@ -239,7 +239,7 @@ async def _run_case(
     fold_threshold: float, max_turns: int, max_cost: float, timeout: float,
     score_mode: str, fold_after_turn: int | None,
     max_fold_limit: int = 3, fold_memory_mode: str = "three_parallel",
-    max_output_tokens: int = 2048,
+    max_output_tokens: int = 2048, fold_tail_tokens: int = 0,
 ) -> dict[str, Any]:
     case_dir = "case-" + hashlib.sha256(case["task_id"].encode("utf-8")).hexdigest()[:16]
     run_dir = output_dir / case_dir / condition
@@ -260,6 +260,8 @@ async def _run_case(
         max_fold_limit=max_fold_limit,
         fold_memory_mode=fold_memory_mode,
         auto_compact_threshold=fold_threshold,
+        # #4：评测默认不保留尾部——尾部原文会让答题与留存虚高、并改变留存分母，混淆被测的摘要质量。
+        fold_tail_tokens=fold_tail_tokens,
         enable_memory_prefetch=False,
         enable_mcp=False,
         enable_online_evolution=False,
@@ -330,6 +332,7 @@ async def _run_case(
         "correct": scoring["correct"], "scoring": scoring,
         "score_mode": score_mode, "fold_count": agent._fold_count,
         "max_fold_limit": max_fold_limit, "fold_memory_mode": fold_memory_mode,
+        "fold_tail_tokens": fold_tail_tokens,
         "max_output_tokens": max_output_tokens,
         "main_input_tokens": agent.total_input_tokens, "main_output_tokens": agent.total_output_tokens,
         "side_input_tokens": agent.side_input_tokens, "side_output_tokens": agent.side_output_tokens,
@@ -358,6 +361,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fold-threshold", type=float, default=AUTO_COMPACT_THRESHOLD)
     parser.add_argument("--max-fold-limit", type=int, default=3, help="Maximum folds per case in fold_on; follows DeepAgent's default")
     parser.add_argument("--fold-memory-mode", choices=["three_parallel", "single_json"], default="three_parallel")
+    parser.add_argument("--fold-tail-tokens", type=int, default=0, help="Verbatim tail kept after each fold (#4); 0 keeps the #1 baseline comparable")
     parser.add_argument("--fold-after-turn", type=int, default=None, help="Schedule one fold after this user turn in fold_on only (multi-turn cases)")
     parser.add_argument("--max-turns", type=int, default=20)
     parser.add_argument("--max-output-tokens", type=int, default=2048, help="Maximum tokens in each main-model response")
@@ -413,6 +417,7 @@ async def main_async(args: argparse.Namespace) -> None:
         "fold_threshold": args.fold_threshold, "max_turns": args.max_turns,
         "max_output_tokens": args.max_output_tokens,
         "max_fold_limit": args.max_fold_limit, "fold_memory_mode": args.fold_memory_mode,
+        "fold_tail_tokens": args.fold_tail_tokens,
         "fold_after_turn": args.fold_after_turn,
         "max_cost_approx_usd": args.max_cost, "timeout_seconds": args.timeout,
         "score_mode": args.score_mode, "text_only": args.text_only,
@@ -433,7 +438,7 @@ async def main_async(args: argparse.Namespace) -> None:
                     max_cost=args.max_cost, timeout=args.timeout, score_mode=args.score_mode,
                     fold_after_turn=args.fold_after_turn,
                     max_fold_limit=args.max_fold_limit, fold_memory_mode=args.fold_memory_mode,
-                    max_output_tokens=args.max_output_tokens,
+                    max_output_tokens=args.max_output_tokens, fold_tail_tokens=args.fold_tail_tokens,
                 )
                 rows.append(row)
                 results.write(json.dumps(row, ensure_ascii=False) + "\n")
