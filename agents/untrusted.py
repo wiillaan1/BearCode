@@ -42,6 +42,11 @@ def _block(name: str, text: str) -> str:
     return f'<tool_output tool="{name}">\n{_CLOSING_TAG.sub(r"&lt;\1>", text)}\n</tool_output>'
 
 
+def wrap_block(name: str, text: str) -> str:
+    """Wrap one piece of external text inside an otherwise unwrapped result (e.g. edit_file's closest snippet)."""
+    return _block(name, text) if WRAP_ENABLED and text else text
+
+
 def wrap_tool_output(name: str, text: str, *, skill_fork: bool = False) -> str:
     if not WRAP_ENABLED or not text or not _wraps(name, skill_fork) or text.startswith(_HARNESS_PREFIXES):
         return text

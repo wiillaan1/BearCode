@@ -204,6 +204,7 @@ cython_debug/
 .bear/caps-e2e/
 .bear/permission-e2e/
 .bear/injection-e2e/
+.bear/round4-e2e/
 .bear/sessions/*.folded-memory.jsonl
 .bear/sessions/*.folded-memory.latest.json
 .bear/sessions/*.dropped.jsonl

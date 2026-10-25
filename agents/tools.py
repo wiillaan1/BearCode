@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import fnmatch
+import heapq
 import hashlib
 import json
 import os
@@ -245,6 +247,47 @@ def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
     return "\n".join(parts)
 
 #编辑文件
+# #20：old_string 未命中时附上最相似的一段，只作提示、不应用、匹配规则不变。上限：12 行 / 1200 字符——
+# 足够看清一处笔误并照抄，又让一次失败的结果保持在约 400 token 内；相似度低于 0.6 不给，免得误导。
+_SNIPPET_MAX_LINES = 12
+_SNIPPET_MAX_CHARS = 1200
+_SNIPPET_MIN_RATIO = 0.6
+_SNIPPET_PREFILTER = 500
+_SNIPPET_CANDIDATES = 20
+_SNIPPET_MAX_FILE_CHARS = 5_000_000  # 超过就不找片段：60K 行 / 2.3MB 的扫描实测约 0.13s，5MB 约 0.3s
+
+
+def _closest_snippet(content: str, old_string: str) -> tuple[float, int, str] | None:
+    """(similarity, first line number, numbered snippet). Three stages keep large files cheap: one quick_ratio
+    per line against the first non-blank line of old_string (character multiset, ~0.13s for 60K lines), a full
+    line ratio for the best 500 (quick_ratio ties on repetitive files, e.g. permuted digits), then window ratios
+    for the best 20 starts only."""
+    old_lines = old_string.splitlines()
+    anchor = next((line.strip() for line in old_lines if line.strip()), "")
+    lines = content.splitlines()
+    if not anchor or not lines or len(content) > _SNIPPET_MAX_FILE_CHARS:
+        return None
+    matcher = difflib.SequenceMatcher(autojunk=False)
+    matcher.set_seq2(anchor)
+    quick = []
+    for index, line in enumerate(lines):
+        matcher.set_seq1(line.strip())
+        quick.append((matcher.quick_ratio(), index))
+    exact = []
+    for _, index in heapq.nlargest(_SNIPPET_PREFILTER, quick):
+        matcher.set_seq1(lines[index].strip())
+        exact.append((matcher.ratio(), index))
+    window = max(1, len(old_lines))
+    best = max((difflib.SequenceMatcher(None, "\n".join(lines[start:start + window]), old_string, autojunk=False).ratio(), start)
+               for _, start in heapq.nlargest(_SNIPPET_CANDIDATES, exact))
+    ratio, start = best
+    if ratio < _SNIPPET_MIN_RATIO:
+        return None
+    shown = lines[start:start + min(window, _SNIPPET_MAX_LINES)]
+    numbered = "\n".join(f"{start + offset + 1:>5} | {line}" for offset, line in enumerate(shown))
+    return ratio, start + 1, numbered[:_SNIPPET_MAX_CHARS]
+
+
 def _edit_file(inp: ToolInput, expected_version=_UNTRACKED) -> str:
     try:
         path = _resolve_tool_path(inp["file_path"]).resolve()
@@ -254,7 +297,16 @@ def _edit_file(inp: ToolInput, expected_version=_UNTRACKED) -> str:
 
         actual = _find_actual_string(content, inp["old_string"])
         if not actual:
-            return f"Error: old_string not found in {inp['file_path']}"
+            message = f"Error: old_string not found in {inp['file_path']}"  # #5 靠这个前缀判失败，保持在最开头
+            closest = _closest_snippet(content, inp["old_string"])
+            if closest:
+                ratio, line_no, snippet = closest
+                # 片段是文件内容（外部数据）：单独包裹；整个 edit_file 结果不包，#3 依赖的 Successfully 前缀不受影响
+                from .untrusted import wrap_block
+                message += (f"\n\nClosest match (similarity {ratio:.2f}, from line {line_no}); not applied. "
+                            "If this is the text you meant, copy it exactly (without the line-number prefix):\n"
+                            + wrap_block("edit_file", snippet))
+            return message
 
         # Normalized matches must be unique in the same representation used to
         # find them, including mixed straight/curly quote spellings.

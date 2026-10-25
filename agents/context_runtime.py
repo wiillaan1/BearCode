@@ -23,7 +23,8 @@ def estimate_tokens(value) -> int:
 class ContextRuntime:
     def _run_compression_pipeline(self) -> None:
         messages = self._openai_messages if self.use_openai else self._anthropic_messages
-        utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+        # #39：与折叠触发同一个估算器——算进刚追加的工具结果，而不是上一次响应的旧数（折叠后它还是 0）
+        utilization = self._estimated_input_tokens() / self.effective_window if self.effective_window else 0
         idle_seconds = time.time() - self.last_api_call_time if self.last_api_call_time else 0
         compact_tool_results(messages, use_openai=self.use_openai,
                              utilization=utilization, idle_seconds=idle_seconds)

@@ -288,10 +288,12 @@ class TurnRequestIdentityTests(Base):
                     msgs += [{"role": "assistant", "content": [{"type": "tool_use", "id": f"t{r}", "name": "read_file", "input": {"file_path": "a"}}]},
                              {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{r}", "content": "z" * 40_000}]}]
             present = lambda: any(m is request for m in self.msgs(agent))
-            # microcompact (idle) alone first: it skips results that snip already replaced
-            agent.last_input_token_count = 0
+            # microcompact (idle) alone first: it skips results that snip already replaced.
+            # #39: pruning now reads the same estimator as folding, which already sees these 240KB of results;
+            # hold the estimate at 0 so this step exercises microcompact only (was: last_input_token_count = 0).
             agent.last_api_call_time = time.time() - 3600
-            agent._run_compression_pipeline()
+            with patch.object(agent, "_estimated_input_tokens", return_value=0):
+                agent._run_compression_pipeline()
             self.assertIn("[Old result cleared]", json.dumps(self.msgs(agent)))
             self.assertTrue(present())
             # then budget (>=0.5) and snip (>=0.6)

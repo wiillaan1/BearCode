@@ -13,7 +13,22 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-console = Console(highlight=False)
+class _LineAwareConsole(Console):
+    """#42: every panel (Info, Cost, tool call, warning, error…) goes through here. If streamed text stopped
+    mid-line, start a new line first; if it ended with a newline, add nothing. Console output itself ends with a
+    newline, so it closes the line."""
+
+    def print(self, *args, **kwargs):
+        global _stream_line_open
+        if _stream_line_open:
+            self.file.write("\n")
+        _stream_line_open = False
+        super().print(*args, **kwargs)
+
+
+console = _LineAwareConsole(highlight=False)
+# #42：流式输出的最后一个字符不是换行时为 True；任何框打印前据此先补一个换行，而不是无条件加空行。
+_stream_line_open = False
 
 # ─── Basic output ──────────────────────────────────────────
 
@@ -78,7 +93,10 @@ def print_user_prompt() -> None:
 
 
 def print_assistant_text(text: str) -> None:
+    global _stream_line_open
     _safe_stdout_write(text)
+    if text:
+        _stream_line_open = not str(text).endswith("\n")
 
 
 def print_tool_call(name: str, inp: dict) -> None:

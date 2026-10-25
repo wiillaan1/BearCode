@@ -40,6 +40,7 @@ from agents.session import save_dropped_messages, save_folded_session_memory, sa
 from agents.subagent import get_sub_agent_config
 from agents.tool_outcome import call_signature, stuck_stop_message, stuck_warning
 from agents import untrusted
+from agents.openai_params import create_with_output_limit
 from agents.checkpoints import CURRENT_CALL
 from agents.verify_on_stop import (
     is_harness_injected_message, is_successful_write, is_verification, load_verify_command_keywords,
@@ -514,15 +515,14 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             model = model_override or self.model
             async def _sq_openai(system:str, user_message:str)->str:
                 self._require_model_budget()
-                resp = await client.chat.completions.create(
-                    model=model,
-                    max_tokens=max(1, int(max_tokens)),
-                    messages=[
+                # #36：新一代 OpenAI 模型要求 max_completion_tokens；报错驱动切换并记住，不维护模型表
+                resp = await create_with_output_limit(client.chat.completions.create, {
+                    "model": model,
+                    "messages": [
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_message},
                     ],
-
-                )
+                }, max(1, int(max_tokens)))
                 usage = getattr(resp, "usage", None)
                 self.side_input_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
                 self.side_output_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
@@ -2284,9 +2284,9 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 stream=True,
                 stream_options={"include_usage": True},
             )
-            if self.max_output_tokens is not None:
-                create_params["max_tokens"] = self.max_output_tokens
-            stream = await self._openai_client.chat.completions.create(**create_params)
+            # #36：只在设置了上限时发送；参数名由 create_with_output_limit 决定（切换发生在流开始之前）
+            stream = await create_with_output_limit(self._openai_client.chat.completions.create, create_params,
+                                                    self.max_output_tokens)
 
             content = ""
             first_text = True
