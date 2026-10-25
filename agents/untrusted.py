@@ -39,7 +39,8 @@ def _wraps(name: str, skill_fork: bool) -> bool:
 
 
 def _block(name: str, text: str) -> str:
-    return f'<tool_output tool="{name}">\n{_CLOSING_TAG.sub(r"&lt;\1>", text)}\n</tool_output>'
+    escaped = _CLOSING_TAG.sub(r"&lt;\1>", text)  # outside the f-string: backslashes in f-string expressions need 3.12+
+    return f'<tool_output tool="{name}">\n{escaped}\n</tool_output>'
 
 
 def wrap_block(name: str, text: str) -> str:
