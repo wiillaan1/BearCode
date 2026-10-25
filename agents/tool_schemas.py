@@ -85,7 +85,7 @@ tool_definitions: list[ToolDef] = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The shell command to execute"},
-                "timeout": {"type": "number", "description": "Timeout in milliseconds (default: 30000)"},
+                "timeout": {"type": "number", "description": "Timeout in milliseconds (default: 30000, max: 600000)"},
             },
             "required": ["command"],
         },

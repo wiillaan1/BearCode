@@ -85,6 +85,20 @@ def _is_context_overflow(error: Exception) -> bool:
 # SDK 0.97 非 beta 的 StopReason 字面量里没有它，但流式累积直接赋值，原字符串能到达（2026-10-25 离线探针实测），用字符串比较。
 ANTHROPIC_CONTEXT_WINDOW_EXCEEDED = "model_context_window_exceeded"
 
+# #45：无人值守入口（one-shot、子 agent）的兜底上限。判断值，没有论文出处：
+# safety-net default, not a budget; override with --max-turns / --max-time。REPL 和 web 默认不设，eval 显式传自己的值。
+SAFETY_NET_MAX_TURNS = 100
+SAFETY_NET_MAX_WALL_SECONDS = 1800.0
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised by _require_model_budget; the main loop turns it into the same graceful exit as its loop-top check."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"Model request blocked: {reason}")
+        self.reason = reason
+
+
 # #4：折叠后保留的原文尾部。默认预算 min(20K, 窗口 20%)，以估算 token 计；最终由阈值收缩裁定。
 FOLD_TAIL_DEFAULT_TOKENS = 20_000
 FOLD_TAIL_DEFAULT_FRACTION = 0.20
@@ -207,6 +221,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                  thinking: bool=False,
                  max_cost_usd: float | None=None,
                  max_turns: int | None=None,
+                 max_wall_seconds: float | None=None,
                  max_output_tokens: int | None=None,
                  input_price_per_million: float=3.0,
                  output_price_per_million: float=15.0,
@@ -254,6 +269,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             raise ValueError("context_window must be an integer of at least 1024 tokens")
         if max_turns is not None and (type(max_turns) is not int or max_turns < 0):
             raise ValueError("max_turns must be a non-negative integer")
+        if max_wall_seconds is not None and not (math.isfinite(max_wall_seconds) and max_wall_seconds > 0):
+            raise ValueError("max_wall_seconds must be a positive number")
         if min(background_skill_concurrency, background_skill_queue_limit) < 1:
             raise ValueError("background Skill limits must be positive")
         self.permission_mode = permission_mode
@@ -282,6 +299,9 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self.tools = [tool for tool in available_tools if enable_folding or tool["name"] != "compact_context"]
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
+        # #6：墙钟上限按每次 chat()（每个用户请求）计时，与按会话累计的费用、回合口径不同；只是软上限（在已有检查点退出）。
+        self.max_wall_seconds = max_wall_seconds
+        self._turn_deadline: float | None = None
         self.max_output_tokens = max_output_tokens
         self.input_price_per_million = input_price_per_million
         self.output_price_per_million = output_price_per_million
@@ -561,6 +581,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._aborted = False
         self.last_finish_reason = None
         self._turn_output_buffer = []
+        self._turn_deadline = time.monotonic() + self.max_wall_seconds if self.max_wall_seconds is not None else None
         self._current_task = asyncio.create_task(self._chat_turn(user_message))
         try:
             await self._current_task
@@ -573,6 +594,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 raise
         finally:
             self._repair_interrupted_tool_calls()
+            self._turn_deadline = None  # 停表：一轮结束后的后台 skill 任务不受墙钟限制
             self._turn_request = None
             self._current_task = None
             self._turn_output_buffer = None
@@ -1023,7 +1045,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
     def _require_model_budget(self) -> None:
         budget = self._check_budget()
         if budget["exceeded"]:
-            raise RuntimeError(f"Model request blocked: {budget['reason']}")
+            raise BudgetExceededError(budget["reason"])
 
     #检查预算
     def _check_budget(self) -> dict:
@@ -1035,6 +1057,9 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return {"exceeded": True, "reason": f"Cost limit reached (${self._get_current_cost_usd():.4f} >= ${self.max_cost_usd})"}
         if self.max_turns is not None and self.current_turns >= self.max_turns:
             return {"exceeded": True, "reason": f"Turn limit reached ({self.current_turns} >= {self.max_turns})"}
+        if self._turn_deadline is not None and time.monotonic() >= self._turn_deadline:
+            limit = f" ({self.max_wall_seconds:.0f}s for this request)" if self.max_wall_seconds is not None else ""
+            return {"exceeded": True, "reason": f"Wall-clock limit reached{limit}"}
         return {"exceeded": False}
 
     #压缩会话
@@ -1734,8 +1759,10 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             permission_mode=self.permission_mode,
             max_cost_usd=(max(0.0, self.max_cost_usd - self._get_current_cost_usd())
                           if self.max_cost_usd is not None else None),
-            max_turns=(max(0, self.max_turns - self.current_turns)
-                       if self.max_turns is not None else None),
+            # #45：子 agent 取 min(父剩余, 兜底值)；父不限时就是兜底值。
+            max_turns=min(SAFETY_NET_MAX_TURNS, max(0, self.max_turns - self.current_turns))
+                      if self.max_turns is not None else SAFETY_NET_MAX_TURNS,
+            max_wall_seconds=self._child_wall_seconds(),
             enable_folding=self.enable_folding,
             max_fold_limit=self.max_fold_limit,
             fold_tail_tokens=self.fold_tail_tokens,
@@ -1777,6 +1804,12 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                         self._account_child_usage(child)
             finally:
                 print_sub_agent_end(agent_type, description)
+
+    def _child_wall_seconds(self) -> float:
+        if self._turn_deadline is None:
+            return SAFETY_NET_MAX_WALL_SECONDS
+        # 父已到期时给一个极小正数：子 agent 的第一次检查就会经父链退出。
+        return max(0.001, min(SAFETY_NET_MAX_WALL_SECONDS, self._turn_deadline - time.monotonic()))
 
     def _register_child(self, child: "Agent") -> None:
         child._budget_parent = self
@@ -1831,13 +1864,21 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             # #38：调用前记下输出 buffer 长度，命中时据此作废已流式输出的截断文本（_with_stream_retry 只在异常时回滚）。
             stream_state = self._capture_stream_output()
             try:
-                response = await self._call_anthropic_stream()
-            except Exception as error:
-                if not _is_context_overflow(error):
-                    raise
+                try:
+                    response = await self._call_anthropic_stream()
+                except Exception as error:
+                    if not _is_context_overflow(error):
+                        raise
+                    if not self.is_sub_agent:
+                        stop_spinner()
+                    response = await self._call_after_overflow(error, self._call_anthropic_stream)
+            except BudgetExceededError as exc:
+                # 预算在调用内部（含 #2 恢复途中的压缩 side query 之后）耗尽：与循环顶部同样优雅退出。
+                self.last_finish_reason = "budget_exceeded"
                 if not self.is_sub_agent:
                     stop_spinner()
-                response = await self._call_after_overflow(error, self._call_anthropic_stream)
+                self._emit_text(f"Budget exceeded: {exc.reason}")
+                break
             self.last_finish_reason = response.stop_reason
             if not self.is_sub_agent:
                 stop_spinner()
@@ -1885,6 +1926,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             # Reserve one tool round only after verifying that a round is available.
             budget = self._check_budget()
             if budget["exceeded"]:
+                self.last_finish_reason = "budget_exceeded"  # 与循环顶部一致（此前停留在 tool_use）
                 print_info(f"Budget exceeded: {budget['reason']}")
                 self._anthropic_messages.append({
                     "role": "user",
@@ -2065,13 +2107,21 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 self._emit_text(f"Budget exceeded: {budget['reason']}")
                 break
             try:
-                response = await self._call_openai_stream()
-            except Exception as error:
-                if not _is_context_overflow(error):
-                    raise
+                try:
+                    response = await self._call_openai_stream()
+                except Exception as error:
+                    if not _is_context_overflow(error):
+                        raise
+                    if not self.is_sub_agent:
+                        stop_spinner()
+                    response = await self._call_after_overflow(error, self._call_openai_stream)
+            except BudgetExceededError as exc:
+                # 预算在调用内部（含 #2 恢复途中的压缩 side query 之后）耗尽：与循环顶部同样优雅退出。
+                self.last_finish_reason = "budget_exceeded"
                 if not self.is_sub_agent:
                     stop_spinner()
-                response = await self._call_after_overflow(error, self._call_openai_stream)
+                self._emit_text(f"Budget exceeded: {exc.reason}")
+                break
 
             if not self.is_sub_agent:
                 stop_spinner()
@@ -2108,6 +2158,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 break
             budget = self._check_budget()
             if budget["exceeded"]:
+                self.last_finish_reason = "budget_exceeded"  # 与循环顶部一致（此前停留在 tool_calls）
                 print_info(f"Budget exceeded: {budget['reason']}")
                 self._append_openai_skipped_tool_results(tool_calls, f"Tool execution skipped: {budget['reason']}")
                 break

@@ -10,7 +10,7 @@ import sys
 import threading
 from pathlib import Path
 
-from .agent import Agent
+from .agent import SAFETY_NET_MAX_TURNS, SAFETY_NET_MAX_WALL_SECONDS, Agent
 from .config import (
     load_env_file as _load_env_file,
     resolve_api_config as _resolve_api_config,
@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-price", type=float, default=None, help="Estimated USD per million output tokens")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
+    parser.add_argument("--max-time", type=float, default=None, help="Max wall-clock seconds per request (soft)")
     parser.add_argument("--context-window", type=int, default=None, help="Model context capacity in tokens")
     parser.add_argument("--no-folding", action="store_true", help="Disable full session folding")
     parser.add_argument("--fold-threshold", type=float, default=0.70, help="Auto-fold at this fraction of the context window")
@@ -435,6 +436,16 @@ async def _run_repl(agent: Agent) -> None:
                 print_error(str(e))
 
 
+def resolve_run_caps(args, *, one_shot: bool) -> dict:
+    """#45: one-shot gets safety-net limits when none are given (safety-net default, not a budget; override with
+    --max-turns / --max-time); the REPL has none. No default cost cap: default token prices are not per-model (#46)."""
+    max_turns, max_time = args.max_turns, args.max_time
+    if one_shot:
+        max_turns = SAFETY_NET_MAX_TURNS if max_turns is None else max_turns
+        max_time = SAFETY_NET_MAX_WALL_SECONDS if max_time is None else max_time
+    return {"max_turns": max_turns, "max_wall_seconds": max_time, "max_cost_usd": args.max_cost}
+
+
 async def run_one_shot(agent: Agent, prompt: str) -> None:
     if agent.permission_mode == "plan":
         async def plan_only_approval_fn(plan_content: str) -> dict:
@@ -474,6 +485,10 @@ Options:
   --output-price USD  Estimated price per million output tokens (default: 15)
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --max-time S        Stop a request after S wall-clock seconds (checked between steps)
+                      One-shot runs default to 100 turns / 1800 s.
+                      safety-net default, not a budget; override with --max-turns / --max-time
+                      The REPL has no default limits.
   --context-window N Model context capacity in tokens
   --no-folding        Disable full session folding
   --fold-threshold X  Auto-fold threshold (0 < X < 1, default: 0.70)
@@ -537,8 +552,7 @@ Examples:
         ),
         permission_mode=permission_mode,
         thinking=args.thinking,
-        max_cost_usd=args.max_cost,
-        max_turns=args.max_turns,
+        **resolve_run_caps(args, one_shot=bool(args.prompt)),
         enable_folding=not args.no_folding,
         auto_compact_threshold=args.fold_threshold,
     )

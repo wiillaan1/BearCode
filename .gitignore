@@ -201,6 +201,7 @@ cython_debug/
 .bear/verify-e2e/
 .bear/compact-tool-e2e/
 .bear/stuck-e2e/
+.bear/caps-e2e/
 .bear/sessions/*.folded-memory.jsonl
 .bear/sessions/*.folded-memory.latest.json
 .bear/sessions/*.dropped.jsonl

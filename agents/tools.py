@@ -393,12 +393,29 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
     tools = all_tools if all_tools is not None else tool_definitions
     return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
 
+# #18：模型传入的 run_shell 超时的上限（Claude Code 同为 600s）；可用环境变量 BEAR_MAX_SHELL_TIMEOUT_MS 覆盖。
+DEFAULT_MAX_SHELL_TIMEOUT_MS = 600_000
+
+
+def _max_shell_timeout_ms() -> int:
+    try:
+        value = int(os.environ.get("BEAR_MAX_SHELL_TIMEOUT_MS", DEFAULT_MAX_SHELL_TIMEOUT_MS))
+    except ValueError:
+        return DEFAULT_MAX_SHELL_TIMEOUT_MS
+    return value if value > 0 else DEFAULT_MAX_SHELL_TIMEOUT_MS
+
+
 #执行shell命令
 async def _run_shell(inp: ToolInput) -> str:
     process = None
     output_task = None
+    requested = inp.get("timeout", 30000)
+    cap = _max_shell_timeout_ms()
+    timeout_ms = cap if isinstance(requested, (int, float)) and requested > cap else requested
+    # 截断说明放在结果末尾：#5 依赖的 "Command failed (exit code" / "Command timed out after" 前缀保持在开头。
+    note = (f"\n\n[timeout capped: requested {requested}ms exceeds the {cap}ms limit; ran with {cap}ms]"
+            if timeout_ms != requested else "")
     try:
-        timeout_ms = inp.get("timeout", 30000)
         timeout_s = timeout_ms / 1000
         if timeout_s <= 0:
             return "Error: timeout must be positive"
@@ -416,12 +433,12 @@ async def _run_shell(inp: ToolInput) -> str:
         if process.returncode != 0:
             stderr = f"\nStderr: {stderr}" if stderr else ""
             stdout = f"\nStdout: {stdout}" if stdout else ""
-            return f"Command failed (exit code {process.returncode}){stdout}{stderr}"
+            return f"Command failed (exit code {process.returncode}){stdout}{stderr}{note}"
         if stderr:
             output += ("\n" if output else "") + "Stderr:\n" + stderr
-        return output or "(no output)"
+        return (output or "(no output)") + note
     except asyncio.TimeoutError:
-        return f"Command timed out after {inp.get('timeout', 30000)}ms"
+        return f"Command timed out after {timeout_ms}ms{note}"
     except asyncio.CancelledError:
         raise
     except Exception as e:
