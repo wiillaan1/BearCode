@@ -40,7 +40,8 @@ class ToolBoundaryTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(path=value):
                 self.assertEqual(tools.check_permission("read_file", {"file_path": value})["action"], "deny")
         self.assertEqual(tools.check_permission("read_file", {"file_path": "other.txt"})["action"], "allow")
-        self.assertEqual(tools.check_permission("read_file", {"file_path": "alias.txt"}, "bypassPermissions")["action"], "allow")
+        # #22: the user's deny rules apply in bypass too (was "allow")
+        self.assertEqual(tools.check_permission("read_file", {"file_path": "alias.txt"}, "bypassPermissions")["action"], "deny")
 
     async def test_discovery_path_rules_and_directory_prefix_keep_boundaries(self):
         for name in ("grep_search", "list_files"):
@@ -84,8 +85,11 @@ class ToolBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("SECRET", search)
         self.assertIn("visible", search)
         self.assertNotIn(blocked, opened)
-        bypass = await tools.execute_tool("grep_search", {"pattern": "needle"}, permission_mode="bypassPermissions")
-        self.assertIn("SECRET", bypass)
+        # #22: discovery filtering no longer has a bypass exemption (was: bypass search found "SECRET");
+        # execute_tool lost its permission_mode parameter, so the bypass call is now the same call
+        bypass = await tools.execute_tool("grep_search", {"pattern": "needle"})
+        self.assertNotIn("SECRET", bypass)
+        self.assertIn("visible", bypass)
 
     @unittest.skipIf(os.name == "nt", "Symlinks require additional Windows privileges")
     async def test_denied_directory_cannot_be_entered_through_glob_or_symlink(self):

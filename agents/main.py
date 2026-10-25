@@ -52,7 +52,8 @@ def parse_args() -> argparse.Namespace:
         add_help=False,
     )
     parser.add_argument("prompt", nargs="*", help="One-shot prompt")
-    parser.add_argument("--yolo", "-y", action="store_true", help="Skip all confirmation prompts")
+    parser.add_argument("--yolo", "-y", action="store_true",
+                        help="Skip all confirmation prompts; your own deny rules and the hard floor still apply")
     parser.add_argument("--plan", action="store_true", help="Plan mode: read-only")
     parser.add_argument("--accept-edits", action="store_true", help="Auto-approve file edits")
     parser.add_argument("--dont-ask", action="store_true", help="Auto-deny confirmations (for CI)")
@@ -472,7 +473,10 @@ def main() -> None:
 Usage: bear-code [options] [prompt]
 
 Options:
-  --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)
+  --yolo, -y          Skip all confirmation prompts (bypassPermissions mode).
+                      Your own deny rules in settings.json still apply, and a short hard floor of
+                      literal catastrophic shell commands (rm -rf / or ~, mkfs/dd on a device, fork bomb)
+                      is denied in every mode with no override. The floor is not a security boundary.
   --plan              Plan mode: read-only, describe changes without executing
   --accept-edits      Auto-approve file edits, still confirm every shell command
   --dont-ask          Auto-deny anything needing confirmation (for CI)

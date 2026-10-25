@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import stat
 import uuid
@@ -23,6 +24,11 @@ PermissionMode = Literal["default", "plan", "acceptEdits", "bypassPermissions", 
 
 READ_TOOLS = {"read_file", "list_files", "grep_search", "compact_context"}
 EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create", "skill_prune", "skill_restore", "state_cleanup"}
+# #23：调用 skill、派生子 agent、搜索工具定义，本身不改文件；子 agent / skill fork 的工具调用各自再过权限。
+ORCHESTRATION_TOOLS = {"skill", "agent", "tool_search"}
+# #21：不是模型工具，而是模型循环之外的运行时操作（authorize_operation / check_permission）用的权限键。
+# 前三个留在 EDIT_TOOLS 里，plan 下拒、acceptEdits 下放行的现有语义不变；mcp_start 走确认分支。
+RUNTIME_OPERATION_KEYS = {"skill_prune", "skill_restore", "state_cleanup", "mcp_start"}
 
 
 #并发安全的工具可以并行运行（只读，无副作用）
@@ -576,9 +582,8 @@ def _path_matches_pattern(value: str, pattern: str) -> bool:
                for candidate in _permission_paths(value) for normalized in patterns)
 
 
-def _discovery_path_filter(tool_name: str, permission_mode: PermissionMode) -> Callable[[Path], bool]:
-    if permission_mode == "bypassPermissions":
-        return lambda path: True
+def _discovery_path_filter(tool_name: str) -> Callable[[Path], bool]:
+    # #22：deny 规则在 bypass 下同样生效，发现路径过滤不再有 bypass 特例。
     rules = [rule for rule in load_permission_rules()["deny"]
              if rule["tool"] in {tool_name, "read_file"}]
     if any(rule["pattern"] in {None, "*"} for rule in rules):
@@ -637,6 +642,87 @@ def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
     return None
 
 
+# ---- #22 硬名单：防字面量的灾难命令，不是安全边界 ----
+# 变量展开、base64、python -c、find -delete、别名等任何间接执行都能绕过；名单很短、宁可漏报，
+# 因为它在任何模式下都拒绝（含 bypass、allow 规则命中、用户确认之后），没有覆盖手段。
+_SHELL_SEPARATOR_CHARS = "();<>|&\n"
+_SHELLS = {"bash", "sh", "zsh"}
+_RM_TARGETS = {"/", "/*", "/.", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "$HOME/*", "${HOME}/", "${HOME}/*"}
+_BLOCK_DEVICE = re.compile(r"^of=/dev/(sd|hd|vd|xvd|nvme|mmcblk|disk|rdisk)")
+# 竖线是转义的字面量 \|，不是整条正则的分支（有测试钉住）。
+_FORK_BOMB = re.compile(r"(\w+|:)\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*\}\s*;\s*\1")
+
+
+def _shell_segments(command: str, *, unwrap: bool = True) -> list[list[str]]:
+    """Quote-aware split on ; && || | & ( ) redirects and newlines; one level of `bash|sh|zsh -c "<cmd>"` unwrapped."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=_SHELL_SEPARATOR_CHARS)
+    lexer.whitespace = lexer.whitespace.replace("\n", "")  # 默认把换行当空白，多行命令会被并成一段
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:  # 引号不平衡：不匹配，宁可漏报
+        return []
+    segments, current = [], []
+    for token in tokens + [";"]:
+        if token and all(ch in _SHELL_SEPARATOR_CHARS for ch in token):
+            if current:
+                segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    stripped = []
+    for words in segments:
+        while words and words[0] in {"sudo", "doas"}:
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                words = words[1:]
+        if words:
+            stripped.append(words)
+            if unwrap and words[0].rsplit("/", 1)[-1] in _SHELLS and "-c" in words[1:-1]:
+                stripped += _shell_segments(words[words.index("-c", 1) + 1], unwrap=False)
+    return stripped
+
+
+def _rm_root_or_home(words: list[str]) -> bool:
+    if words[0].rsplit("/", 1)[-1] != "rm":
+        return False
+    recursive = any(w in {"-r", "-R", "--recursive"} or (w.startswith("-") and not w.startswith("--") and ("r" in w or "R" in w))
+                    for w in words[1:])
+    return recursive and any(w in _RM_TARGETS for w in words[1:])
+
+
+def _mkfs_device(words: list[str]) -> bool:
+    return words[0].rsplit("/", 1)[-1].startswith("mkfs") and any(w.startswith("/dev/") for w in words[1:])
+
+
+def _dd_block_device(words: list[str]) -> bool:
+    return words[0].rsplit("/", 1)[-1] == "dd" and any(_BLOCK_DEVICE.match(w) for w in words[1:])
+
+
+def _segment_rule(check: Callable[[list[str]], bool]) -> Callable[[str], bool]:
+    return lambda command: any(check(words) for words in _shell_segments(command))
+
+
+# 进程内可用 patch 替换（真实运行用无害的标记规则）；不提供环境变量或配置项，否则就成了能关掉底线的开关。
+_HARD_FLOOR_RULES: list[tuple[str, Callable[[str], bool]]] = [
+    ("rm root/home", _segment_rule(_rm_root_or_home)),
+    ("mkfs device", _segment_rule(_mkfs_device)),
+    ("dd to block device", _segment_rule(_dd_block_device)),
+    ("fork bomb", lambda command: bool(_FORK_BOMB.search(command))),
+]
+
+
+def hard_floor_violation(command: str) -> str | None:
+    return next((name for name, check in _HARD_FLOOR_RULES if check(command)), None)
+
+
+def _hard_floor_reason(tool_name: str, inp: dict) -> str | None:
+    if tool_name != "run_shell" and not tool_name.startswith("mcp__"):
+        return None
+    command = inp.get("command") if isinstance(inp, dict) else None
+    return hard_floor_violation(command) if isinstance(command, str) else None
+
+
 def check_permission(
     tool_name: str,
     inp: dict,
@@ -644,12 +730,17 @@ def check_permission(
     plan_file_path: str | None = None,
 ) -> dict:
     """Returns {"action": "allow"|"deny"|"confirm", "message": ...}"""
-    if mode == "bypassPermissions":
-        return {"action": "allow"}
+    floor = _hard_floor_reason(tool_name, inp)
+    if floor:
+        return {"action": "deny", "message": f"Hard floor: {floor} (literal catastrophic command; not a security boundary)"}
 
+    # #22：用户自己的 deny 规则排在 bypass 之前——--yolo 不能让 deny 失效（Rec. 11）。
     rule_result = _check_permission_rules(tool_name, inp)
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
+
+    if mode == "bypassPermissions":
+        return {"action": "allow"}
 
     if mode == "plan":
         if tool_name == "mcp_start" or tool_name.startswith("mcp__"):
@@ -669,7 +760,7 @@ def check_permission(
     if tool_name in READ_TOOLS:
         return {"action": "allow"}
 
-    if tool_name in ("enter_plan_mode", "exit_plan_mode"):
+    if tool_name in ("enter_plan_mode", "exit_plan_mode") or tool_name in ORCHESTRATION_TOOLS:
         return {"action": "allow"}
 
     if tool_name.startswith("mcp__"):
@@ -715,7 +806,10 @@ def check_permission(
             return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
         return {"action": "confirm", "message": confirm_message}
 
-    return {"action": "allow"}
+    # #23：未分类的工具不静默放行（Rec. 10）；dontAsk 下自然变成拒绝。注册工具的分类由测试保证。
+    if mode == "dontAsk":
+        return {"action": "deny", "message": f"Auto-denied (dontAsk mode): Unclassified tool: {tool_name}"}
+    return {"action": "confirm", "message": f"Unclassified tool: {tool_name}\nArguments: {json.dumps(inp, ensure_ascii=False, sort_keys=True, default=str)}"}
 
 
 #----------------执行工具调用-----------------------
@@ -788,7 +882,7 @@ def _check_file_write_state(name: str, inp: ToolInput, read_file_state: dict[str
 
 async def execute_tool(
     name: str, inp: ToolInput, read_file_state: dict[str, FileVersion] | None = None, *,
-    truncate_result: bool = True, permission_mode: PermissionMode = "default",
+    truncate_result: bool = True,
 ) -> str:
     from .validation import validate_json
 
@@ -815,7 +909,7 @@ async def execute_tool(
         handler = _write_file if name == "write_file" else _edit_file
         result = handler(inp, expected_version=read_file_state.get(path))
     elif name in {"list_files", "grep_search"}:
-        path_allowed = _discovery_path_filter(name, permission_mode)
+        path_allowed = _discovery_path_filter(name)
         handler = _list_files if name == "list_files" else _grep_search
         result = await asyncio.to_thread(handler, inp, path_allowed)
     else:

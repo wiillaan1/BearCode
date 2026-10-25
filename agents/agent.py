@@ -1567,8 +1567,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
-        result = await execute_tool(name, inp, self._read_file_state, truncate_result=False,
-                                    permission_mode=self.permission_mode)
+        result = await execute_tool(name, inp, self._read_file_state, truncate_result=False)
         if name in {"skill_create", "skill_evolve"}:
             try:
                 parsed = json.loads(result)
