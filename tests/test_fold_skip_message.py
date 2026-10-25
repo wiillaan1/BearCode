@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from agents.agent import FOLD_SKIPPED_ALL_IN_TAIL, Agent
+from agents.tool_outcome import is_tool_failure
 
 
 def short_agent(use_openai: bool) -> Agent:
@@ -31,7 +32,7 @@ class FoldSkipMessageTests(unittest.TestCase):
                 result = asyncio.run(agent._execute_compact_context_tool({"reason": "stuck"}))
                 self.assertEqual(result, FOLD_SKIPPED_ALL_IN_TAIL)
                 self.assertNotIn("insufficient history", result)
-                self.assertFalse(agent._looks_like_tool_failure("compact_context", result, ""))
+                self.assertFalse(is_tool_failure("compact_context", result))  # #5: prefix rule replaced _looks_like_tool_failure
                 out = io.StringIO()
                 with redirect_stdout(out):
                     asyncio.run(agent.compact())

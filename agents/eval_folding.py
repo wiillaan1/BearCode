@@ -32,6 +32,10 @@ class EvaluationBudgetExceeded(Exception):
     pass
 
 
+class EvaluationStuck(Exception):
+    pass
+
+
 class EvaluationOutputTruncated(Exception):
     pass
 
@@ -281,6 +285,8 @@ async def _run_case(
             output = str(result.get("text") or "")
             if agent._aborted:
                 raise RuntimeError("agent run was aborted")
+            if getattr(agent, "last_finish_reason", None) == "stuck":  # #5：stuck 退出不能当成一次答错来计分
+                raise EvaluationStuck(output.strip().splitlines()[0] if output.strip() else "agent stopped: stuck")
             if index == len(case["prompts"]) - 1 and getattr(agent, "last_finish_reason", None) in {"max_tokens", "length"}:
                 raise EvaluationOutputTruncated("final response hit the per-response output token limit")
             if condition == "fold_on" and fold_after_turn == index + 1 and agent._fold_count == 0:
@@ -301,6 +307,8 @@ async def _run_case(
             status, error = "budget_exceeded", str(exc)
         except EvaluationOutputTruncated as exc:
             status, error = "truncated", str(exc)
+        except EvaluationStuck as exc:
+            status, error = "stuck", str(exc)
         except Exception as exc:
             if agent._aborted and time.monotonic() - started >= timeout:
                 status, error = "timeout", f"exceeded {timeout} seconds"

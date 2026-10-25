@@ -38,6 +38,7 @@ from agents.session_memory import (
 )
 from agents.session import save_dropped_messages, save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
+from agents.tool_outcome import call_signature, stuck_stop_message, stuck_warning
 from agents.verify_on_stop import (
     is_harness_injected_message, is_successful_write, is_verification, load_verify_command_keywords,
     verify_on_stop_prompt,
@@ -220,6 +221,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                  enable_folding: bool=True,
                  max_fold_limit: int | None=None,
                  fold_tail_tokens: int | None=None,
+                 stuck_warn_after: int = 3,
+                 stuck_stop_after: int = 6,
                  fold_memory_mode: str="single_json",
                  auto_compact_threshold: float=AUTO_COMPACT_THRESHOLD,
                  enable_memory_prefetch: bool=True,
@@ -233,6 +236,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             raise ValueError("max_fold_limit must be non-negative")
         if fold_tail_tokens is not None and fold_tail_tokens < 0:
             raise ValueError("fold_tail_tokens must be non-negative")
+        if not 1 <= stuck_warn_after <= stuck_stop_after:
+            raise ValueError("stuck thresholds must satisfy 1 <= stuck_warn_after <= stuck_stop_after")
         if fold_memory_mode not in {"single_json", "three_parallel"}:
             raise ValueError("fold_memory_mode must be single_json or three_parallel")
         if max_output_tokens is not None and max_output_tokens < 2:
@@ -262,6 +267,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self.enable_folding = enable_folding
         self.max_fold_limit = max_fold_limit
         self.fold_tail_tokens = fold_tail_tokens
+        self.stuck_warn_after = stuck_warn_after
+        self.stuck_stop_after = stuck_stop_after
         self.fold_memory_mode = fold_memory_mode
         self.auto_compact_threshold = auto_compact_threshold
         if not math.isfinite(memory_recall_timeout) or memory_recall_timeout <= 0:
@@ -351,9 +358,12 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._folded_session_memories: list[dict[str, Any]] = []
         self._fold_last_time: float = 0.0
         self._fold_count: int = 0
-        self._tool_error_streak: int = 0
-        self._same_tool_repeat_count: int = 0
-        self._last_tool_name: str = ""
+        # #5 stuck detection：相同调用签名且没有进展的连续次数。不随折叠清零（折叠清零会让卡住的循环永远躲开检测），
+        # 只在新一轮用户请求、清空历史、用户在提示里选继续时清零。
+        self._stuck_signature: str | None = None
+        self._stuck_digest: str | None = None
+        self._stuck_streak: int = 0
+        self._stuck_stop: tuple[str, int, str] | None = None
         # verify-on-stop (#3) 本轮账本：单调序号，最后一次成功写 / 最后一次验证的序号。
         self._tool_seq: int = 0
         self._last_write_seq: int = 0
@@ -660,10 +670,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         return (
             "\n\n# Runtime Fold Guidance\n"
             f"- Current context utilization: {utilization:.0%}\n"
-            f"- Recent tool error streak: {self._tool_error_streak}\n"
-            f"- Same tool repeat count: {self._same_tool_repeat_count}\n"
             f"- Last fold: {last_fold}\n"
-            "- If the context is getting long, the same tool is being retried without progress, or tool failures are accumulating, call `compact_context` before trying more tools.\n"
+            "- If the context is getting long, call `compact_context`.\n"
             "- If you folded very recently and the next step is clear, prefer continuing rather than folding again.\n"
         )
 
@@ -679,16 +687,52 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         if self.use_openai and self._openai_messages:
             self._openai_messages[0]["content"] = self._system_prompt
 
-    def _record_tool_outcome(self, tool_name: str, success: bool) -> None:
-        if tool_name == self._last_tool_name:
-            self._same_tool_repeat_count += 1
+    def _reset_stuck(self) -> None:
+        self._stuck_signature = self._stuck_digest = None
+        self._stuck_streak = 0
+        self._stuck_stop = None
+
+    def _track_progress(self, call_id: str, tool_name: str, args: Any, raw_arguments: str | None = None) -> str:
+        """#5: count consecutive identical calls without progress; returns text to append to the tool_result."""
+        record = self._tool_checkpoints.get(call_id, {})
+        signature = call_signature(tool_name, args, raw_arguments)
+        failed, digest = record.get("failed"), record.get("digest")
+        if signature == self._stuck_signature and (failed or digest == self._stuck_digest):
+            self._stuck_streak += 1
         else:
-            self._same_tool_repeat_count = 1
-        self._last_tool_name = tool_name
-        if success:
-            self._tool_error_streak = 0
+            self._stuck_streak = 1  # 不同调用，或相同调用但结果变了：有进展
+        self._stuck_signature, self._stuck_digest = signature, digest
+        if self._stuck_streak >= self.stuck_stop_after:
+            self._stuck_stop = (tool_name, self._stuck_streak, str(record.get("result") or ""))
+        if self._stuck_streak < self.stuck_warn_after:
+            return ""
+        if not self.is_sub_agent:
+            print_info(f"stuck: {tool_name} repeated {self._stuck_streak} times without progress — warning the model.")
+        # 独立一段、固定前缀；#25 将来包裹工具输出时放在这段之前，harness 警告不进「不可信」标记。
+        return stuck_warning(tool_name, self._stuck_streak)
+
+    async def _stop_if_stuck(self) -> bool:
+        """After a whole tool round: ask an attending user, otherwise stop. True means break the loop."""
+        if self._stuck_stop is None:
+            return False
+        tool_name, count, last_result = self._stuck_stop
+        attended = (not self.is_sub_agent and self.confirm_fn is not None and self.permission_mode != "dontAsk")
+        if attended and await self._confirm_dangerous(
+                f"Agent seems stuck: {tool_name} repeated {count} times without progress. Continue?"):
+            self._reset_stuck()
+            return False
+        message = stuck_stop_message(tool_name, count, last_result)
+        self.last_finish_reason = "stuck"
+        if not self.is_sub_agent:
+            stop_spinner()
+        self._emit_text(message)
+        # 写进历史，下一轮模型知道自己为什么被停；工具回合已闭合，assistant 文本在其后合法。
+        if self.use_openai:
+            self._openai_messages.append({"role": "assistant", "content": message})
         else:
-            self._tool_error_streak += 1
+            self._anthropic_messages.append({"role": "assistant", "content": [{"type": "text", "text": message}]})
+        self._stuck_stop = None
+        return True
 
     def _reset_verify_ledger(self) -> None:
         self._tool_seq = self._last_write_seq = self._last_verify_seq = 0
@@ -723,17 +767,6 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
     def _record_fold_event(self) -> None:
         self._fold_last_time = time.time()
         self._fold_count += 1
-        self._tool_error_streak = 0
-        self._same_tool_repeat_count = 0
-        self._last_tool_name = ""
-
-    def _looks_like_tool_failure(self, tool_name: str, raw: str, result: str) -> bool:
-        text = f"{raw}\n{result}".lower()
-        if any(marker in text for marker in ("error", "denied", "timed out", "timeout")):
-            return True
-        if tool_name == "compact_context" and "no context compaction" in text:
-            return True
-        return False
 
     def _augment_user_message_with_skill_context(self, user_message: str) -> tuple[str, dict[str, Any] | None]:
         try:
@@ -1527,13 +1560,11 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return f"Context folding limit reached ({self.max_fold_limit}). Continue without compacting."
         reason = str(inp.get("reason") or "").strip()
         compacted = await self._compact_conversation(trigger="tool")
+        # 计数只在循环里按结果前缀记一次（#5 修掉了这里原有的重复记账）。
         if not compacted and self._fold_skip_reason:
-            self._record_tool_outcome("compact_context", True)  # 无需压缩不是失败
             return self._fold_skip_reason
         if not compacted:
-            self._record_tool_outcome("compact_context", False)
             return "Compaction skipped: insufficient history or memory generation failed validation. Original conversation history was retained."
-        self._record_tool_outcome("compact_context", True)
         self._context_cleared = True
         suffix = f"\nReason: {reason}" if reason else ""
         return (
@@ -1664,9 +1695,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._last_request_bytes = None
         self._fold_last_time = 0.0
         self._fold_count = 0
-        self._tool_error_streak = 0
-        self._same_tool_repeat_count = 0
-        self._last_tool_name = ""
+        self._reset_stuck()
 
     async def _execute_agent_tool(self, inp: dict) -> str:
         config = get_sub_agent_config(inp.get("type", "general"))
@@ -1710,6 +1739,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             enable_folding=self.enable_folding,
             max_fold_limit=self.max_fold_limit,
             fold_tail_tokens=self.fold_tail_tokens,
+            stuck_warn_after=self.stuck_warn_after,
+            stuck_stop_after=self.stuck_stop_after,
             fold_memory_mode=self.fold_memory_mode,
             auto_compact_threshold=self.auto_compact_threshold,
             enable_memory_prefetch=self.enable_memory_prefetch,
@@ -1772,6 +1803,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         user_message = _safe_utf8_text(await self._recall_before_response(user_message))
         # 先把本轮用户输入放入 Anthropic 消息历史，后续每轮模型调用都会带上这段上下文。
         self._reset_verify_ledger()
+        self._reset_stuck()  # 新一轮用户请求本身就是介入
         self._overflow_stop_handled = False
         self._turn_request = {"role": "user", "content": user_message}
         self._anthropic_messages.append(self._turn_request)
@@ -1883,8 +1915,9 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 inp = tu.input
                 res = await self._run_tracked_tool(tu.id, tu.name, inp)
                 print_tool_result(tu.name, res)
-                self._record_tool_outcome(tu.name, not self._tracked_tool_failed(tu.id, tu.name, res))
+                warning = self._track_progress(tu.id, tu.name, inp)
                 self._record_verify_ledger(tu.name, inp, res)
+                res += warning
 
                 if self._context_cleared:
                     # 工具执行过程中如果清理了上下文，就把结果作为新的用户消息写入，
@@ -1903,6 +1936,10 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 self._anthropic_messages.append({"role": "user", "content": tool_results})
 
             self._context_cleared = False
+
+            # #5：整个工具回合的结果都已追加后才处理第 2 级（问用户 / 退出），不在回合中途 break。
+            if await self._stop_if_stuck():
+                break
 
             # 工具结果可能很长，每轮工具执行后检查是否需要压缩上下文。
             self._refresh_runtime_system_prompt()
@@ -2007,6 +2044,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return
         user_message = _safe_utf8_text(await self._recall_before_response(user_message))
         self._reset_verify_ledger()
+        self._reset_stuck()  # 新一轮用户请求本身就是介入
         self._turn_request = {"role": "user", "content": user_message}
         self._openai_messages.append(self._turn_request)
 
@@ -2109,11 +2147,10 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
 
                         results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
                         for ct_item, res in results:
-                            self._record_tool_outcome(
-                                ct_item["fn"],
-                                not self._tracked_tool_failed(ct_item["tc"]["id"], ct_item["fn"], res),
-                            )
+                            warning = self._track_progress(ct_item["tc"]["id"], ct_item["fn"], ct_item["inp"],
+                                                           ct_item["tc"]["function"].get("arguments"))
                             self._record_verify_ledger(ct_item["fn"], ct_item["inp"], res)
+                            res += warning
                             self._openai_messages.append(
                                 {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                     else:
@@ -2122,11 +2159,10 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                                 break
                             res = await self._run_tracked_tool(ct["tc"]["id"], ct["fn"], ct["inp"])
                             print_tool_result(ct["fn"], res)
-                            self._record_tool_outcome(
-                                ct["fn"],
-                                not self._tracked_tool_failed(ct["tc"]["id"], ct["fn"], res),
-                            )
+                            warning = self._track_progress(ct["tc"]["id"], ct["fn"], ct["inp"],
+                                                           ct["tc"]["function"].get("arguments"))
                             self._record_verify_ledger(ct["fn"], ct["inp"], res)
+                            res += warning
 
                             if self._context_cleared:
                                 self._context_cleared = False
@@ -2149,6 +2185,9 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 )
 
             self._context_cleared = False
+            # #5：整个工具回合的结果都已追加后才处理第 2 级（问用户 / 退出）。
+            if await self._stop_if_stuck():
+                break
             self._refresh_runtime_system_prompt()
 
     def _append_openai_skipped_tool_results(self, tool_calls: list[dict], reason: str) -> None:

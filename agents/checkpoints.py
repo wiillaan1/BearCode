@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextvars import ContextVar
 
 from .result_storage import persist_tool_result
+from .tool_outcome import is_tool_failure, result_digest
 
 CURRENT_CALL = ContextVar("checkpoint_call", default=None)
 
@@ -34,9 +35,11 @@ class ToolCheckpoints:
             raise
         finally:
             CURRENT_CALL.reset(token)
-        failed = self._looks_like_tool_failure(name, result, "")
+        # #5：成败与结果摘要按原始结果算——超过 30KB 的结果落盘后换成带 uuid 路径的预览，前缀和内容都不再可比。
+        failed = is_tool_failure(name, result)
+        digest = result_digest(result)
         stored = persist_tool_result(name, result)
-        record.update(status="completed", failed=failed, **stored)
+        record.update(status="completed", failed=failed, digest=digest, **stored)
         self._save_tool_checkpoint()
         return stored["result"]
 
@@ -44,7 +47,7 @@ class ToolCheckpoints:
         record = self._tool_checkpoints.get(call_id, {})
         if isinstance(record.get("failed"), bool):
             return record["failed"]
-        return self._looks_like_tool_failure(name, result, result)
+        return is_tool_failure(name, result)
 
     def _recover_tool_checkpoints(self) -> None:
         messages = self._openai_messages if self.use_openai else self._anthropic_messages

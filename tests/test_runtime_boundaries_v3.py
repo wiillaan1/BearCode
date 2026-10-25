@@ -162,7 +162,8 @@ class RuntimeBoundariesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_large_failure_classification_survives_preview_truncation(self):
         agent = self.agent()
-        agent._run_checked_tool = AsyncMock(return_value="x" * 40000 + "\nError: failed at end")
+        # #5: a real run_shell failure starts with "Command failed"; exit 0 with "Error" in the output is not a failure
+        agent._run_checked_tool = AsyncMock(return_value="Command failed (exit code 1)\nStdout: " + "x" * 40000 + "\nError: failed at end")
         agent._begin_tool_round([("failed", "run_shell")])
         preview = await agent._run_tracked_tool("failed", "run_shell", {})
         self.assertNotIn("failed at end", preview)
