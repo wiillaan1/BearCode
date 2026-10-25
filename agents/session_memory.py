@@ -168,6 +168,10 @@ def split_previous_memory(messages: list[dict[str, Any]]) -> tuple[str | None, l
     return None, messages
 
 
+def is_folded_memory_message(msg: Any) -> bool:
+    return isinstance(msg, dict) and msg.get("role") == "user" and bool(_FOLDED_MEMORY_BLOCK.match(_content_text(msg.get("content"))))
+
+
 def _previous_memory_section(previous_memory: str) -> str:
     return (
         f"<previous-memory>\n{previous_memory}\n</previous-memory>\n\n"

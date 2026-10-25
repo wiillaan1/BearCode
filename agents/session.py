@@ -40,6 +40,12 @@ def save_folded_session_memory(session_id: str, record: dict[str, Any]) -> None:
     write_json(d / f"{session_id}.folded-memory.latest.json", record)
 
 
+def save_dropped_messages(session_id: str, records: list[dict[str, Any]]) -> None:
+    path = get_project_session_dir() / f"{session_id}.dropped.jsonl"
+    for record in records:
+        append_jsonl(path, record)
+
+
 def load_session(session_id: str) -> dict[str, Any] | None:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
         return None

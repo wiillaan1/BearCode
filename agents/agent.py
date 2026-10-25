@@ -31,11 +31,12 @@ from agents.session_memory import (
     build_folding_user_prompt,
     build_openai_transcript,
     format_folded_memory,
+    is_folded_memory_message,
     parse_folded_memory,
     parse_fold_component,
     split_previous_memory,
 )
-from agents.session import save_folded_session_memory, save_session
+from agents.session import save_dropped_messages, save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
 from agents.tools import (
     FileVersion, ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS,
@@ -59,6 +60,26 @@ def _is_retryable(error: Exception) -> bool:
     if "overloaded" in msg or "ECONNRESET" in msg or "ETIMEDOUT" in msg:
         return True
     return False
+
+
+# 上下文溢出：#2 反应式压缩只处理这类 400，其余 400 原样抛出。
+def _is_context_overflow(error: Exception) -> bool:
+    if isinstance(error, openai.BadRequestError):
+        return getattr(error, "code", None) == "context_length_exceeded"
+    if isinstance(error, anthropic.BadRequestError):
+        msg = str(error).lower()
+        if "prompt is too long" in msg:
+            return True
+        # 未实测，待真实报文核实：旧模型"输入 + max_tokens 超窗口"的 400 措辞不含 prompt is too long，
+        # 用关键字组合兜住；花费上限等其他 4XX 的 message 不含 context。DeepSeek 兼容端点格式日后补。
+        return "context" in msg and ("exceed" in msg or "too long" in msg)
+    return False
+
+
+OVERFLOW_FALLBACK_ROUNDS = 2
+OVERFLOW_KEEP_FRACTION = 0.5
+OVERFLOW_MARKER_TEXT = "[Context overflow: {n} earlier messages were dropped to fit the context window; their content is no longer available.]"
+_OVERFLOW_MARKER = re.compile(r"\A\[Context overflow: (\d+) earlier messages were dropped")
 
 
 def _safe_utf8_text(value: object) -> str:
@@ -1066,8 +1087,9 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             print_info("Context window filling up, compacting conversation...")
             await self._compact_conversation(trigger="auto")
 
-    async def _compact_conversation(self, *, trigger: str = "manual")->bool:
-        if not self.enable_folding or self._fold_limit_reached():
+    async def _compact_conversation(self, *, trigger: str = "manual", ignore_fold_limit: bool = False)->bool:
+        # ignore_fold_limit 只绕过"这次能不能折"；折了照样计入 _fold_count——"折过几次"如实记账，是显式决定。
+        if not self.enable_folding or (not ignore_fold_limit and self._fold_limit_reached()):
             return False
         if self.use_openai:
             compacted = await self._compact_openai(trigger=trigger)
@@ -1079,6 +1101,99 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
 
     def _fold_limit_reached(self) -> bool:
         return self.max_fold_limit is not None and self._fold_count >= self.max_fold_limit
+
+    #溢出反应式恢复（#2）：压缩 + 重试一次；仍失败则砍最早消息兜底，最多 OVERFLOW_FALLBACK_ROUNDS 轮。
+    async def _call_after_overflow(self, error: Exception, call):
+        if await self._compact_conversation(trigger="overflow", ignore_fold_limit=True):
+            try:
+                return await call()
+            except Exception as retry_error:
+                if not _is_context_overflow(retry_error):
+                    raise
+                error = retry_error
+        for fallback_round in range(1, OVERFLOW_FALLBACK_ROUNDS + 1):
+            if not self._drop_earliest_messages(fallback_round):
+                raise error
+            try:
+                return await call()
+            except Exception as retry_error:
+                if not _is_context_overflow(retry_error):
+                    raise
+                error = retry_error
+        raise error
+
+    def _is_user_text_message(self, msg: dict) -> bool:
+        if msg.get("role") != "user":
+            return False
+        return self.use_openai or not self._anthropic_tool_result_ids(msg)
+
+    def _drop_earliest_messages(self, fallback_round: int) -> bool:
+        """Drop the oldest whole units until the history is at most half its size; never splits a tool_use/tool_result pair.
+
+        Units: each earlier turn (user text up to the next user text) and, in the current turn, each tool round
+        (assistant + its results). Kept: system message, folded-memory block, current user message, last unit.
+        """
+        messages = self._openai_messages if self.use_openai else self._anthropic_messages
+        start = 0
+        if start < len(messages) and messages[start].get("role") == "system":
+            start += 1
+        if start < len(messages) and is_folded_memory_message(messages[start]):
+            start += 1
+        prior_dropped = 0
+        region = []
+        for msg in messages[start:]:
+            match = _OVERFLOW_MARKER.match(msg.get("content")) if isinstance(msg.get("content"), str) and msg.get("role") == "user" else None
+            if match:
+                prior_dropped += int(match.group(1))
+            else:
+                region.append(msg)
+        current = max((i for i, msg in enumerate(region) if self._is_user_text_message(msg)), default=-1)
+        units: list[list[dict]] = []
+        for i, msg in enumerate(region):
+            if not units or self._is_user_text_message(msg) or (i > current and msg.get("role") == "assistant"):
+                units.append([msg])
+            else:
+                units[-1].append(msg)
+        current_unit = next((k for k, unit in enumerate(units) if current >= 0 and unit[0] is region[current]), None)
+        droppable = [k for k in range(len(units) - 1) if k != current_unit]
+        if not droppable:
+            return False
+
+        def size(msgs: list[dict]) -> int:
+            return sum(len(json.dumps(m, ensure_ascii=False, default=str).encode("utf-8")) for m in msgs)
+
+        target = size(region) * OVERFLOW_KEEP_FRACTION
+        remaining = size(region)
+        dropped_units: set[int] = set()
+        for k in droppable:
+            if remaining <= target:
+                break
+            dropped_units.add(k)
+            remaining -= size(units[k])
+        dropped = [m for k in sorted(dropped_units) for m in units[k]]
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            save_dropped_messages(self.session_id, _sanitize_for_utf8([
+                {"time": now, "session_id": self.session_id, "fallback_round": fallback_round, "message": m}
+                for m in dropped]))
+        except Exception as exc:
+            logging.warning("Failed to persist dropped messages; dropping anyway: %s", exc)
+
+        total = prior_dropped + len(dropped)
+        marker = {"role": "user", "content": OVERFLOW_MARKER_TEXT.format(n=total)}
+        in_turn = current_unit is not None and any(k > current_unit for k in dropped_units)
+        kept: list[dict] = [] if in_turn else [marker]
+        for k, unit in enumerate(units):
+            if k in dropped_units:
+                continue
+            kept.extend(unit)
+            if in_turn and k == current_unit:
+                kept.append(marker)
+        messages[start:] = kept
+        self.last_input_token_count = 0
+        self._last_request_bytes = None
+        print_info(f"Context overflow: dropped {len(dropped)} earliest messages (saved to {self.session_id}.dropped.jsonl).")
+        return True
 
     async def _compact_anthropic(self, *, trigger: str)->bool:
         if len (self._anthropic_messages)<4:
@@ -1481,7 +1596,14 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                     stop_spinner()
                 self._emit_text(f"Budget exceeded: {budget['reason']}")
                 break
-            response = await self._call_anthropic_stream()
+            try:
+                response = await self._call_anthropic_stream()
+            except Exception as error:
+                if not _is_context_overflow(error):
+                    raise
+                if not self.is_sub_agent:
+                    stop_spinner()
+                response = await self._call_after_overflow(error, self._call_anthropic_stream)
             self.last_finish_reason = response.stop_reason
             if not self.is_sub_agent:
                 stop_spinner()
@@ -1687,7 +1809,14 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                     stop_spinner()
                 self._emit_text(f"Budget exceeded: {budget['reason']}")
                 break
-            response = await self._call_openai_stream()
+            try:
+                response = await self._call_openai_stream()
+            except Exception as error:
+                if not _is_context_overflow(error):
+                    raise
+                if not self.is_sub_agent:
+                    stop_spinner()
+                response = await self._call_after_overflow(error, self._call_openai_stream)
 
             if not self.is_sub_agent:
                 stop_spinner()
