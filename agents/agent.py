@@ -80,6 +80,10 @@ def _is_context_overflow(error: Exception) -> bool:
     return False
 
 
+# #38：Claude 4.5+ 输入 + max_tokens 超窗口时请求被接受、生成撞窗口后以此 stop_reason 正常结束（不抛异常）。
+# SDK 0.97 非 beta 的 StopReason 字面量里没有它，但流式累积直接赋值，原字符串能到达（2026-10-25 离线探针实测），用字符串比较。
+ANTHROPIC_CONTEXT_WINDOW_EXCEEDED = "model_context_window_exceeded"
+
 OVERFLOW_FALLBACK_ROUNDS = 2
 OVERFLOW_KEEP_FRACTION = 0.5
 OVERFLOW_MARKER_TEXT = "[Context overflow: {n} earlier messages were dropped to fit the context window; their content is no longer available.]"
@@ -334,6 +338,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._turn_written_files: list[str] = []
         self._verify_guard_fired: bool = False
         self._verify_keywords: tuple[str, ...] = ()
+        # #38：本轮是否已处理过 model_context_window_exceeded（每轮一次机会）。
+        self._overflow_stop_handled: bool = False
 
         #构建系统提示词
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
@@ -1163,6 +1169,20 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 error = retry_error
         raise error
 
+    async def _recover_from_overflow_stop(self, stop_reason: str | None, stream_state) -> bool:
+        """#38: compact and retry this turn when generation hit the context window; True means `continue`."""
+        if stop_reason != ANTHROPIC_CONTEXT_WINDOW_EXCEEDED or self._overflow_stop_handled:
+            return False
+        # 先置标志再压缩：压缩失败也算用掉本轮这次机会，同一轮再撞不再花第二次折叠 side query。
+        self._overflow_stop_handled = True
+        if not await self._compact_conversation(trigger="overflow_stop", ignore_fold_limit=True):
+            return False
+        # 截断响应没有进入历史；已流式输出的半截文本从 buffer 截回，终端上打印作废提示。
+        self._discard_stream_output(stream_state)
+        if not self.is_sub_agent:
+            print_info("model_context_window_exceeded: conversation compacted, retrying this turn.")
+        return True
+
     def _is_user_text_message(self, msg: dict) -> bool:
         if msg.get("role") != "user" or is_harness_injected_message(msg):
             return False
@@ -1616,6 +1636,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         user_message = _safe_utf8_text(await self._recall_before_response(user_message))
         # 先把本轮用户输入放入 Anthropic 消息历史，后续每轮模型调用都会带上这段上下文。
         self._reset_verify_ledger()
+        self._overflow_stop_handled = False
         self._anthropic_messages.append({"role": "user", "content": user_message})
 
         while True:
@@ -1638,6 +1659,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                     stop_spinner()
                 self._emit_text(f"Budget exceeded: {budget['reason']}")
                 break
+            # #38：调用前记下输出 buffer 长度，命中时据此作废已流式输出的截断文本（_with_stream_retry 只在异常时回滚）。
+            stream_state = self._capture_stream_output()
             try:
                 response = await self._call_anthropic_stream()
             except Exception as error:
@@ -1656,6 +1679,11 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             self.total_output_tokens += response.usage.output_tokens
             self.last_input_token_count = response.usage.input_tokens
 
+            # #38：放在 usage 记账之后（截断响应已实际计费）、追加 assistant 之前（命中路径从不写入历史），
+            # 也就先于下面的 #3 guard 与截断守卫。未命中、已处理过、未开折叠或压缩失败时落回原路径，一行不变。
+            if await self._recover_from_overflow_stop(response.stop_reason, stream_state):
+                continue
+
             # Anthropic 的响应内容里可能混有 text block 和 tool_use block，这里只挑出工具调用。
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
@@ -1665,8 +1693,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
                 "content": [self._block_to_dict(b) for b in response.content],
             })
 
-            # #38（未实现）：stop_reason == "model_context_window_exceeded" 的比对放在这里，
-            # 先于下面的 verify-on-stop 与截断守卫：不完整的响应应先压缩重试，而不是被要求验证。
+            # #38 已在上方、追加 assistant 之前处理；到这里的响应要么未命中，要么已退回原行为。
 
             # 没有工具调用，说明模型已经给出最终回复，本轮对话结束。
             if not tool_uses:
@@ -1888,7 +1915,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
 
             tool_calls = message.get("tool_calls")
 
-            # #38（未实现）：finish_reason 的上下文溢出比对放在这里，先于 verify-on-stop 与截断守卫。
+            # #38 不做 OpenAI：finish_reason="length" 分不清 max_tokens 截断与撞窗口；输入超窗口的 400 由 #2 处理。
             if not tool_calls:
                 # verify-on-stop（#3）：同 _chat_anthropic。
                 guard = self._take_verify_on_stop_prompt()
