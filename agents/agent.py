@@ -96,6 +96,10 @@ FOLD_SINGLE_MAX_TOKENS = 6000
 # 取观测最大值 × 2，且不超过理论上界（输出顶满 × 4 字符/token ÷ 3）。偏小的代价只是安全复核打印一行、下次折叠吸收。
 FOLD_MEMORY_RESERVE_TOKENS = min(2 * 2326, max(3 * FOLD_COMPONENT_MAX_TOKENS, FOLD_SINGLE_MAX_TOKENS) * 4 // 3)
 
+# #44：全部历史都在保留的尾部里、无可折内容时，/compact 与 compact_context 共用的说明。
+FOLD_SKIPPED_ALL_IN_TAIL = ("No compaction needed: the whole conversation already fits in the verbatim tail kept after "
+                            "folding, so there is nothing older to summarise. Conversation history was retained.")
+
 # #41：本轮请求估算超过窗口这一比例时不必构造折叠后历史再估，直接不放回（真正的判据是折叠后的估算）。
 TURN_REQUEST_PRECHECK_FRACTION = 0.25
 
@@ -361,6 +365,8 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         self._overflow_stop_handled: bool = False
         # #41：本轮请求消息对象（_chat_* 追加时记下，chat() 结束清空）；折叠时按对象身份放回记忆块之后。
         self._turn_request: dict | None = None
+        # #44：最近一次 _compact_conversation 不折叠的原因（仅「全部在尾部」这种非失败情况）。
+        self._fold_skip_reason: str | None = None
 
         #构建系统提示词
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
@@ -1005,7 +1011,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return
         compacted = await self._compact_conversation(trigger="manual")
         if not compacted:
-            print_info("Compaction skipped; conversation history was retained.")
+            print_info(self._fold_skip_reason or "Compaction skipped; conversation history was retained.")
 
 
     #恢复会话信息
@@ -1158,6 +1164,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
 
     async def _compact_conversation(self, *, trigger: str = "manual", ignore_fold_limit: bool = False)->bool:
         # ignore_fold_limit 只绕过"这次能不能折"；折了照样计入 _fold_count——"折过几次"如实记账，是显式决定。
+        self._fold_skip_reason = None
         if not self.enable_folding or (not ignore_fold_limit and self._fold_limit_reached()):
             return False
         if self.use_openai:
@@ -1303,6 +1310,7 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
         previous_memory, _ = split_previous_memory(_sanitize_for_utf8(messages))
         plan = self._plan_fold(messages)
         if plan is None:  # 头部为空：全部历史都在尾部里，没有可折的内容；不是失败
+            self._fold_skip_reason = FOLD_SKIPPED_ALL_IN_TAIL
             return False
         transcript_messages, kept, request, tail_kept, notes = plan
         build_transcript = build_openai_transcript if self.use_openai else build_anthropic_transcript
@@ -1519,6 +1527,9 @@ class Agent(BackgroundSkillTasks, ToolExecution, ContextRuntime, StreamAttempts,
             return f"Context folding limit reached ({self.max_fold_limit}). Continue without compacting."
         reason = str(inp.get("reason") or "").strip()
         compacted = await self._compact_conversation(trigger="tool")
+        if not compacted and self._fold_skip_reason:
+            self._record_tool_outcome("compact_context", True)  # 无需压缩不是失败
+            return self._fold_skip_reason
         if not compacted:
             self._record_tool_outcome("compact_context", False)
             return "Compaction skipped: insufficient history or memory generation failed validation. Original conversation history was retained."
